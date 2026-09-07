@@ -24,6 +24,7 @@ from nanobot.providers.base import (
 )
 from nanobot.providers.oauth_model_catalog import OAuthModelCatalog, OAuthModelCatalogSnapshot
 from nanobot.providers.openai_responses import (
+    ResponsesStreamCapture,
     consume_sse_with_reasoning,
     convert_messages,
     convert_tools,
@@ -170,6 +171,7 @@ class XAIGrokProvider(LLMProvider):
             hosted_tool_retried = False
             retry_usage: LLMUsage | None = None
             while True:
+                capture = ResponsesStreamCapture()
                 try:
                     result = await _request_xai(
                         DEFAULT_XAI_GROK_URL,
@@ -179,6 +181,7 @@ class XAIGrokProvider(LLMProvider):
                         on_content_delta=on_content_delta,
                         on_thinking_delta=on_thinking_delta,
                         on_tool_call_delta=on_tool_call_delta,
+                        capture=capture,
                     )
                     break
                 except _XAIHTTPError as exc:
@@ -217,6 +220,10 @@ class XAIGrokProvider(LLMProvider):
                 finish_reason=finish_reason,
                 usage=usage,
                 reasoning_content=reasoning_content,
+                context_acceptance="accepted" if capture.completed and
+                finish_reason in {"stop", "length", "tool_calls"} and not
+                {"messages", "input", "instructions", "system", "prompt"}.intersection(self._extra_body)
+                else "unknown",
             )
         except Exception as exc:
             response = _xai_error_response(exc)
@@ -371,6 +378,7 @@ async def _request_xai(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    capture: ResponsesStreamCapture | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, LLMUsage | None, str | None]:
     active_hosted_tools: dict[str, dict[str, Any]] = {}
     stream_output_emitted = False
@@ -425,6 +433,7 @@ async def _request_xai(
                     _forward_thinking_delta if on_thinking_delta is not None else None
                 ),
                 on_response_event=_on_response_event,
+                capture=capture,
             )
             if result[2] != "error" and active_hosted_tools:
                 active = list(active_hosted_tools.values())

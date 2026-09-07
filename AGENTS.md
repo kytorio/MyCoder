@@ -1,5 +1,51 @@
 This file provides guidance to AI coding agents working with this repository.
 
+## Current Planning Gate — 2026-09-06
+
+The user has withdrawn the previous governance implementation and spec/tasks.
+The active replacement scope is ONLY sections 3 (context compression),
+4 (explicit memory and Dream), and 6 (evaluation) of the Feishu technical plan,
+document I2gWde9xOoz8n3xKwI6cRsognpb, revision 70.
+Read spec/README.md and spec/TASKS.md. On 2026-09-06 the user replaced H01 with
+an LLM-invoked memory_save tool and confirmed H02-H05. No input-intent service
+or separate memory-classification model is planned. Follow minimal-change reuse.
+The user has now explicitly authorized implementation of this revision. Development must
+complete N00/N01/N01A evaluation capabilities, long-context and memory-dependent
+baseline tasks before changing production context or memory behavior.
+Keep work in MyCoder on codex/agent-governance; do not reset main, commit or push.
+The older roadmap paragraph below is preserved for provenance but is superseded
+by this gate, including its S01-S06 and T00-T17 references and continuation rules.
+Retired code/spec artifacts are under .superpowers/sdd/RETIRED-governance-v1-20260906;
+they are not active implementation requirements or reusable completed work.
+
+## MyCoder Development Scope
+
+All development for the lifecycle, context governance, security policy,
+human approval, evaluation, and settings roadmap must take place in **MyCoder**,
+at `E:\Code\Agent\MyCoder` (`origin`: `https://github.com/kytorio/MyCoder.git`).
+The original `E:\Code\Agent\nanobot` checkout and the nanobot study workspace are
+research references only, not implementation targets. Keep the existing `nanobot/`
+package and CLI names unless a separate rename is explicitly requested.
+
+Before implementation, read [spec/README.md](spec/README.md), the mandatory
+[development boundary](spec/S00-development-boundary.md), the relevant S01-S06
+spec, and its task under [spec/TASKS.md](spec/TASKS.md). These documents define
+scope, interfaces, reusable code, task dependencies, and acceptance checks.
+Update the affected spec and dependent tasks before changing their boundaries.
+As of 2026-09-06, all planned Goal-specific changes are withdrawn by the user.
+Preserve existing Goal behavior/data; generic Stop lifecycle work remains in scope.
+S03 and T12/T12A/T13/T14 are withdrawn records, not implementation tasks.
+
+The development branch is `codex/agent-governance`, created from MyCoder `main`
+at `455533169d5a641300dd63d260b1ff5543c4093c`. Continue on that branch;
+do not recreate/reset it, develop directly on `main`, or automatically merge/pull
+`upstream/main` as part of this roadmap. The upstream contribution workflow below
+is background guidance, not authorization to change the pinned baseline or push.
+Preserve the existing uncommitted `webui/package-lock.json` change and do not
+include it in unrelated commits. All T00-T17 implementation tasks remain unstarted
+at spec import time. Later status updates must reflect actual progress; completion
+requires the task's own tests and acceptance checks to have been completed.
+
 ## Project Overview
 
 nanobot is a lightweight, open-source AI agent framework written in Python with a React/TypeScript WebUI. It centers around a small agent loop that receives messages from chat channels, invokes an LLM provider, executes tools, and manages session memory.

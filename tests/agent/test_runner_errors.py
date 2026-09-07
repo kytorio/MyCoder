@@ -18,6 +18,49 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
 
+@pytest.mark.parametrize("failure", ["overflow", "exception", "late_stream", "timeout"])
+async def test_n07_runner_errors_never_advance_verified_history(tmp_path, failure):
+    from nanobot.agent.context_governance import ContextGovernor
+    from nanobot.agent.runner import AgentRunner
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.config.schema import ContextConfig
+    from tests.agent.test_context_acceptance import EvidenceProvider, compaction_for
+
+    raw, compaction = compaction_for([{"role": "user", "content": "imported history"}])
+    error = (LLMResponse(content="context window exceeded", finish_reason="error", error_status_code=400)
+             if failure == "overflow" else TimeoutError("expired") if failure == "timeout"
+             else RuntimeError("synthetic failure"))
+
+    class FailingProvider(EvidenceProvider):
+        _CHAT_RETRY_DELAYS = []
+
+        async def chat_stream(self, **kwargs):
+            await kwargs["on_content_delta"]("partial")
+            raise RuntimeError("late failure")
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self):
+            return failure == "late_stream"
+
+    boundaries = []
+
+    class RecordingGovernor(ContextGovernor):
+        def record_response(self, state, response):
+            super().record_response(state, response)
+            boundaries.append(state.compaction.raw_accepted_boundary)
+
+    runner = AgentRunner()
+    runner.context_governor = RecordingGovernor()
+    result = await runner.run(make_run_spec(FailingProvider([error]), model="offline",
+        initial_messages=None, transcript_input=compaction.transcript_input,
+        transcript_builder=compaction.transcript_builder, consolidate_history=compaction.consolidate_history,
+        tools=ToolRegistry(), max_iterations=1, max_tool_result_chars=1000, hook=StreamingHook(),
+        context_config=ContextConfig(mode="enforce"), runtime_data_dir=tmp_path))
+    assert boundaries == [0]
+    assert result.error
+    assert any(m.get("content") == "imported history" for m in result.messages)
+
+
 @pytest.mark.asyncio
 async def test_runner_returns_tool_exception_to_model_for_recovery():
     from nanobot.agent.runner import AgentRunner

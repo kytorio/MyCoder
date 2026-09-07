@@ -534,6 +534,9 @@ class BedrockProvider(LLMProvider):
             content="".join(content_parts) or None,
             tool_calls=tool_calls,
             finish_reason=cls._finish_reason(cast(str | None, response.get("stopReason"))),
+            context_acceptance="accepted" if response.get("stopReason") in {
+                "end_turn", "max_tokens", "tool_use"
+            } else "unknown",
             usage=cls._usage(cast(dict[str, Any] | None, response.get("usage"))),
             reasoning_content="".join(reasoning_parts) or None,
             thinking_blocks=thinking_blocks or None,
@@ -666,6 +669,9 @@ class BedrockProvider(LLMProvider):
             content="".join(content_parts) or None,
             tool_calls=tool_calls,
             finish_reason=cls._finish_reason(state.get("stop_reason")),
+            context_acceptance="accepted" if state.get("stop_reason") in {
+                "end_turn", "max_tokens", "tool_use"
+            } else "unknown",
             usage=cls._usage(state.get("usage")),
             reasoning_content="".join(reasoning_parts) or None,
             thinking_blocks=thinking_blocks or None,

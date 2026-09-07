@@ -441,6 +441,75 @@ class GitStore:
 
     # -- restore ---------------------------------------------------------------
 
+    def read_revert_candidate(
+        self,
+        commit: str,
+        *,
+        message_prefix: str | None = None,
+    ) -> tuple[dict[str, str], dict[str, str]] | None:
+        """Read a commit and its parent as a restore candidate without writing.
+
+        The first mapping is the selected commit tree and the second mapping is
+        its parent tree. Missing tracked files are represented as empty text so
+        callers can validate the complete candidate before changing canonical
+        files or the Git index.
+        """
+        if not self.is_initialized():
+            return None
+
+        try:
+            from dulwich.repo import Repo
+
+            full_sha = self._resolve_sha(commit)
+            if not full_sha:
+                logger.warning("Git restore candidate: SHA not found: {}", commit)
+                return None
+
+            with Repo(str(self._workspace)) as repo:
+                commit_obj = repo[full_sha]
+                if commit_obj.type_name != b"commit":
+                    return None
+                typed_commit = cast("Commit", commit_obj)
+                commit_message = typed_commit.message.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+                if message_prefix is not None and not commit_message.startswith(
+                    message_prefix
+                ):
+                    logger.warning(
+                        "Git restore candidate: commit {} does not match prefix {!r}",
+                        commit,
+                        message_prefix,
+                    )
+                    return None
+                if not typed_commit.parents:
+                    logger.warning(
+                        "Git restore candidate: cannot restore root commit {}",
+                        commit,
+                    )
+                    return None
+
+                committed_tree = cast("Tree", repo[typed_commit.tree])
+                parent_obj = repo[typed_commit.parents[0]]
+                if parent_obj.type_name != b"commit":
+                    return None
+                parent = cast("Commit", parent_obj)
+                parent_tree = cast("Tree", repo[parent.tree])
+                committed = {
+                    path: self._read_blob_from_tree(repo, committed_tree, path) or ""
+                    for path in self._tracked_files
+                }
+                parent_files = {
+                    path: self._read_blob_from_tree(repo, parent_tree, path) or ""
+                    for path in self._tracked_files
+                }
+                return committed, parent_files
+        except Exception as exc:
+            raise GitStoreError(
+                f"Git restore candidate read failed for {commit}"
+            ) from exc
+
     def revert(self, commit: str, *, message_prefix: str | None = None) -> str | None:
         """Revert (undo) the changes introduced by the given commit.
 

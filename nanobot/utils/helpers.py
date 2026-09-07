@@ -543,12 +543,18 @@ def _cleanup_tool_result_buckets(root: Path, current_bucket: Path) -> None:
 
 
 def _write_text_atomic(path: Path, content: str) -> None:
+    """Compatibility entry point retaining platform-default newline handling."""
+    write_text_atomic(path, content)
+
+
+def write_text_atomic(path: Path, content: str, *, newline: str | None = None) -> None:
+    """Durably replace text; exact-byte runtime stores pass ``newline=''``."""
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     existing_mode: int | None = None
     with suppress(OSError):
         existing_mode = stat.S_IMODE(path.stat().st_mode)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline=newline) as f:
             if existing_mode is not None:
                 os.chmod(tmp, existing_mode)
             f.write(content)

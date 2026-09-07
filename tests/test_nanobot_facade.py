@@ -1633,14 +1633,10 @@ async def test_runtime_helpers_expose_model_workspace_and_compact(tmp_path):
     runtime = bot._loop.llm_runtime()
     bot._loop.runtime_for_session = MagicMock(return_value=runtime)  # type: ignore[method-assign]
 
-    compact_session = AsyncMock()
-    bot._loop.consolidator.compact_idle_session = compact_session
-    snapshot = await bot.runtime.compact_session("sdk:history")
-    assert snapshot.key == "sdk:history"
-    compact_session.assert_awaited_once_with(
-        "sdk:history",
-        runtime=runtime,
-    )
+    compacted = await bot.runtime.compact_session("sdk:history")
+    assert compacted.key == "sdk:history"
+    assert compacted.applied is False
+    assert compacted.reason == "no_accepted_history"
     assert bot.runtime.model == bot._loop.model
     assert bot.runtime.workspace == tmp_path
 
@@ -1652,6 +1648,66 @@ async def test_runtime_helpers_expose_model_workspace_and_compact(tmp_path):
         runtime=runtime,
         max_suffix=4,
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_compact_session_commits_only_accepted_history(tmp_path):
+    from nanobot.agent.context_plan import (
+        ContextConsumption,
+        ContextRequestOutcome,
+        ContextSummaryCandidate,
+        StructuredContextSummary,
+        history_message_hash,
+        render_context_summary,
+    )
+    from nanobot.config.schema import ContextConfig
+    from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT
+
+    config_path = _write_config(tmp_path)
+    workspace = tmp_path / "workspace"
+    bot = Nanobot.from_config(config_path, workspace=workspace)
+    session = bot._loop.sessions.get_or_create("sdk:accepted-history")
+    accepted = {"role": "user", "content": "Keep output concise."}
+    session.messages = [accepted, {"role": "assistant", "content": "unaccepted delta"}]
+    session.context_consumption = ContextConsumption(
+        outcome=ContextRequestOutcome("request", "lineage", 0, "accepted"),
+        history_hashes=(history_message_hash(accepted),),
+        accepted_messages_json=(
+            json.dumps({"role": "system", "content": "old policy"}, sort_keys=True),
+            json.dumps(accepted, sort_keys=True),
+        ),
+    )
+    bot._loop.sessions.save(session)
+    bot._loop.context_config = ContextConfig(mode="enforce")
+    structured = StructuredContextSummary(
+        schema_version=1,
+        tasks=["Continue"],
+        constraints=[],
+        explicit_preferences=["Keep output concise."],
+        decisions=[],
+        file_changes=[],
+        errors=[],
+        evidence_refs=[],
+        remaining_work=["Process the delta"],
+    )
+    bot._loop.consolidator.summarize_transcript = AsyncMock(
+        return_value=ContextSummaryCandidate(
+            text=render_context_summary(structured),
+            structured=structured,
+        )
+    )
+
+    compacted = await bot.runtime.compact_session("sdk:accepted-history")
+
+    assert compacted.applied is True
+    assert compacted.reason == "summarized"
+    assert [message["content"] for message in session.messages] == [
+        "Keep output concise.",
+        SUMMARY_CONTINUATION_TEXT,
+        "unaccepted delta",
+    ]
+    assert session.last_archived == 1
+    assert session.context_consumption is None
 
 
 @pytest.mark.asyncio

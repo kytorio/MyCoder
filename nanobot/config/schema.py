@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
+    from nanobot.agent.tools.memory_save import MemoryToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
     from nanobot.agent.tools.web import WebToolsConfig
@@ -185,10 +186,36 @@ class AgentDefaults(Base):
         return value
 
 
+class ContextConfig(Base):
+    """Context planning; observe never activates the new compression layers."""
+
+    mode: Literal["observe", "enforce"] = "observe"
+    enabled_layers: list[Literal["L1", "L2", "L3", "L4"]] = Field(
+        default_factory=lambda: ["L1", "L2", "L3", "L4"])
+    high_watermark: float = Field(default=0.85, gt=0, lt=1)
+    target_ratio: float = Field(default=0.65, gt=0, lt=1)
+    safety_margin_tokens: int | None = Field(default=None, gt=0, strict=True)
+    tool_result_token_budget: int = Field(default=2048, gt=0, strict=True)
+    tool_batch_token_budget: int = Field(default=8192, gt=0, strict=True)
+    artifact_max_bytes: int = Field(default=134217728, gt=0, strict=True)
+    schema_discovery: bool = False
+
+    @model_validator(mode="after")
+    def validate_context(self) -> ContextConfig:
+        if len(set(self.enabled_layers)) != len(self.enabled_layers):
+            raise ValueError("enabledLayers must be unique")
+        if self.target_ratio >= self.high_watermark:
+            raise ValueError("targetRatio must be below highWatermark")
+        if self.tool_result_token_budget > self.tool_batch_token_budget:
+            raise ValueError("toolResultTokenBudget must not exceed toolBatchTokenBudget")
+        return self
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    context: ContextConfig = Field(default_factory=ContextConfig)
 
 
 class ProviderConfig(Base):
@@ -397,6 +424,12 @@ class ToolsConfig(Base):
     my: MyToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.self", "MyToolConfig"))
     image_generation: ImageGenerationToolConfig = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.image_generation", "ImageGenerationToolConfig"),
+    )
+    memory: MemoryToolConfig = Field(
+        default_factory=lambda: _lazy_default(
+            "nanobot.agent.tools.memory_save",
+            "MemoryToolConfig",
+        ),
     )
     max_session_messages_per_minute: int = Field(default=6, ge=1)
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
@@ -680,6 +713,7 @@ def _resolve_tool_config_refs() -> None:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
+    from nanobot.agent.tools.memory_save import MemoryToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
     from nanobot.agent.tools.web import WebFetchConfig, WebSearchConfig, WebToolsConfig
@@ -694,6 +728,7 @@ def _resolve_tool_config_refs() -> None:
     mod.WebFetchConfig = WebFetchConfig  # type: ignore[attr-defined]
     mod.MyToolConfig = MyToolConfig  # type: ignore[attr-defined]
     mod.ImageGenerationToolConfig = ImageGenerationToolConfig  # type: ignore[attr-defined]
+    mod.MemoryToolConfig = MemoryToolConfig  # type: ignore[attr-defined]
 
     ToolsConfig.model_rebuild()
     Config.model_rebuild()

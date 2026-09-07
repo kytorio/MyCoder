@@ -403,6 +403,8 @@ class AzureOpenAIProvider(LLMProvider):
                 usage=usage,
                 reasoning_content=reasoning_content,
             )
+            if capture.completed and finish_reason in {"stop", "length", "tool_calls"}:
+                result.context_acceptance = "accepted"
             if capture.completed and is_replayable_finish_reason(finish_reason):
                 result.provider_state = build_responses_state(
                     provider=self._responses_state_provider(),

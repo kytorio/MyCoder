@@ -12,6 +12,7 @@ import time
 import weakref
 from collections.abc import Coroutine, Iterable, Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext, suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
@@ -26,9 +27,20 @@ from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.automation_turns import publish_next_deferred_turn
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver, TranscriptInput
+from nanobot.agent.context_artifacts import ToolResultArtifactStore
+from nanobot.agent.context_governance import (
+    ContextCompactionResult,
+    ContextCompactionState,
+    ContextGovernanceConfig,
+    ModelRequestState,
+)
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
+from nanobot.agent.memory_writes import (
+    shared_memory_write_coordinator,
+    workspace_memory_authorizer,
+)
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
@@ -54,9 +66,10 @@ from nanobot.bus.outbound_events import StreamedResponseEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import RuntimeEventBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.config.schema import AgentDefaults, ContextConfig, ModelPresetConfig
 from nanobot.llm_usage.context import source_from_request
 from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
+from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
@@ -98,6 +111,7 @@ from nanobot.session.summary import (
     SUMMARY_CONTINUATION_TEXT,
     SessionSummary,
     SessionSummaryCheckpoint,
+    session_summary_from_metadata,
 )
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
 from nanobot.utils.cancellation import task_is_cancelling
@@ -124,11 +138,15 @@ _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 _SUBAGENT_TERMINAL_WAIT_SECONDS = 300.0
 
 
+# TurnKind 区分“用户消息回合”与“系统内部回合”（如子代理结果回传、cron/本地触发器等）。
 class TurnKind(Enum):
     USER = auto()
     SYSTEM = auto()
 
 
+# TurnContext 是单次回合（turn）的可变状态容器，贯穿七个处理阶段：
+# RESTORE -> COMPACT -> COMMAND -> BUILD -> RUN -> SAVE -> RESPOND（见 _process_message）。
+# 每个阶段函数只读写自己需要的字段，字段按“阶段产出”的顺序大致排列。
 @dataclass
 class TurnContext:
     msg: InboundMessage
@@ -181,12 +199,14 @@ class TurnContext:
     turn_latency_ms: int | None = None
     usage: LLMUsage | None = None
 
+    # 断言 runtime 已在 BUILD 阶段写入，供 RUN 及之后阶段安全读取。
     def require_runtime(self) -> LLMRuntime:
         """Return the runtime established by the BUILD stage."""
         if self.runtime is None:
             raise RuntimeError("turn runtime is not initialized; BUILD must run before this stage")
         return self.runtime
 
+    # 断言 session 已在 RESTORE 阶段写入，供后续阶段安全读取。
     def require_session(self) -> Session:
         """Return the session established by the RESTORE stage."""
         if self.session is None:
@@ -206,38 +226,46 @@ class AgentLoop:
     5. Sends responses back
     """
 
+    # 对外暴露当前已注册工具的名称列表。
     @property
     def tool_names(self) -> list[str]:
         return self.tools.tool_names
 
+    # 只读访问当前生效的 LLM provider 实例。
     @property
     def provider(self) -> LLMProvider:
         """Provider selected for future turn admissions."""
         return self.runtime_resolver.runtime.provider
 
+    # 只读访问当前生效的模型名。
     @property
     def model(self) -> str:
         """Model selected for future turn admissions."""
         return self.runtime_resolver.runtime.model
 
+    # 只读访问当前生效的上下文窗口大小（token 数）。
     @property
     def context_window_tokens(self) -> int:
         """Context limit selected for future turn admissions."""
         return self.runtime_resolver.runtime.context_window_tokens
 
+    # 暴露配置中的模型预设表，供 UI/命令展示与选择。
     @property
     def model_presets(self) -> Mapping[str, ModelPresetConfig]:
         """Configured model presets exposed for selection and display."""
         return self.runtime_resolver.model_presets
 
+    # 当前默认预设名（可能为 None，表示未选择预设）。
     @property
     def model_preset(self) -> str | None:
         return self.runtime_resolver.model_preset
 
+    # 通过属性赋值切换默认预设，等价于调用 set_model_preset。
     @model_preset.setter
     def model_preset(self, name: str | None) -> None:
         self.set_model_preset(name)
 
+    # 解析并返回下一次回合应使用的 runtime；模型/预设/签名发生变化时广播运行时事件。
     def llm_runtime(self) -> LLMRuntime:
         """Resolve the immutable default used to admit the next turn."""
         previous = self.runtime_resolver.runtime
@@ -250,6 +278,7 @@ class AgentLoop:
             self._publish_runtime_selection(runtime)
         return runtime
 
+    # 解析 Dream（记忆整理）专用的模型预设，不影响默认 runtime 的选择。
     def dream_runtime(self) -> LLMRuntime | None:
         """Resolve the optional preset used for Dream without changing defaults."""
         if not self.dream_model_preset:
@@ -257,10 +286,15 @@ class AgentLoop:
         return self.runtime_resolver.resolve_preset(self.dream_model_preset)
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+    _SUMMARY_CHECKPOINT_KEY = "summary_checkpoint"
+    _SUMMARY_CHECKPOINT_DELTA_KEY = "summary_checkpoint_delta"
+    _SUMMARY_CHECKPOINT_VERSION = 1
     _PENDING_USER_TURN_KEY = "pending_user_turn"
     _PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
     _PROVIDER_STATE_CHECKPOINT_VERSION = "v1"
 
+    # 构造函数：装配所有子系统（会话、工具、子代理、cron/本地触发器、自动压缩等），
+    # 是整个 AgentLoop 的“接线图”，具体职责见各字段旁的中文注释。
     def __init__(
         self,
         bus: MessageBus,
@@ -302,13 +336,26 @@ class AgentLoop:
         local_trigger_store: LocalTriggerStore | None = None,
         idle_compact_check_interval_seconds: int = 0,
         recovery_admission: RecoveryAdmission | None = None,
+        context_config: ContextConfig | None = None,
+        runtime_data_dir: Path | None = None,
+        context_artifact_store: ToolResultArtifactStore | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
         self.bus = bus
+        self.context_config = context_config or ContextConfig()
+        self.runtime_data_dir = runtime_data_dir
+        self.context_artifact_store = None
+        if self.context_config.mode == "enforce":
+            self.context_artifact_store = context_artifact_store
+            if self.context_artifact_store is None and runtime_data_dir is not None:
+                self.context_artifact_store = ToolResultArtifactStore(
+                    runtime_data_dir / "context-artifacts", max_bytes=self.context_config.artifact_max_bytes)
         self._recovery_admission = recovery_admission
+        # turn_delivery_factory 负责把回合结果（流式/非流式）投递到具体通道；
+        # 若外部未注入则用同一个 bus/runtime_events 自建一份，保证事件总线只有一份。
         if turn_delivery_factory is not None:
             if turn_delivery_factory.bus is not bus:
                 raise ValueError("turn delivery factory must use the agent message bus")
@@ -382,7 +429,25 @@ class AgentLoop:
         self._extra_hooks: list[AgentHook] = hooks or []
         self._hook_factories: list[AgentTurnHookFactory] = hook_factories or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        # context 负责组装 system prompt / 历史 / 记忆 / 技能等上下文；
+        # sessions 是会话的存储与生命周期管理（持久化、TTL、删除观察者）。
+        memory_writer = (
+            shared_memory_write_coordinator(
+                workspace,
+                runtime_data_dir,
+                authorize=workspace_memory_authorizer(workspace),
+                transaction_max_bytes=_tc.memory.transaction_max_bytes,
+                journal_max_bytes=_tc.memory.journal_max_bytes,
+            )
+            if runtime_data_dir is not None
+            else None
+        )
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            memory_writer=memory_writer,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
@@ -393,6 +458,8 @@ class AgentLoop:
         self.sessions.set_delete_observer(self._file_state_store.discard)
         self.tools = tool_registry if tool_registry is not None else ToolRegistry()
         self._exec_session_manager = ExecSessionManager()
+        # runner 是真正驱动“发消息给 LLM -> 收工具调用 -> 执行工具 -> 再发消息”多轮循环的执行器；
+        # AgentLoop 只负责回合的生命周期编排，具体的 LLM 交互都委托给 runner。
         self.runner = AgentRunner()
         self.subagents = SubagentManager(
             workspace=workspace,
@@ -421,6 +488,8 @@ class AgentLoop:
         self._pending_queues: dict[str, asyncio.Queue[InboundMessage]] = {}
         self._preserve_inflight_turns_on_shutdown = False
         self._deferred_automation_turns: dict[str, list[InboundMessage]] = {}
+        # cron / 本地触发器产生的“自动化回合”若命中一个正在处理中的会话，
+        # 不能直接抢占，而是先递延（deferred），等当前回合结束后再补发。
         self._cron_turns = CronTurnCoordinator(
             publish_inbound=self.bus.publish_inbound,
             dispatch=self._dispatch,
@@ -465,6 +534,8 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+    # 从 Config 对象构造 AgentLoop 的便捷入口：把配置字段映射为 __init__ 的参数，
+    # 调用方仍可通过 extra 覆盖或补充任意参数。
     @classmethod
     def from_config(
         cls,
@@ -488,8 +559,18 @@ class AgentLoop:
         if bus is None:
             bus = MessageBus()
         defaults = config.agents.defaults
+        runtime_data_dir = extra.get("runtime_data_dir", config.runtime_data_dir)
+        if runtime_data_dir is None and (
+            config.agents.context.mode == "enforce" or config.tools.memory.enabled
+        ):
+            raise ValueError(
+                "context enforce and memory_save require a runtime data root; "
+                "load Config from a path, call bind_source_path(), or pass runtime_data_dir"
+            )
+        extra.setdefault("context_config", config.agents.context)
+        extra.setdefault("runtime_data_dir", runtime_data_dir)
         if "session_manager" not in extra:
-            data_dir = config.runtime_data_dir
+            data_dir = runtime_data_dir
             extra["session_manager"] = SessionManager(
                 config.workspace_path,
                 sessions_root=data_dir / "sessions" if data_dir is not None else None,
@@ -533,14 +614,17 @@ class AgentLoop:
             **extra,
         )
 
+    # 把可能被运行时修改过的 max_iterations 同步给子代理管理器，保持限制一致。
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
 
+    # 标记 runtime 配置失效，下次 admit() 时才真正重新解析（懒刷新）。
     def invalidate_runtime_config(self) -> None:
         """Invalidate runtime config for lazy refresh at the next admission."""
         self.runtime_resolver.invalidate()
 
+    # 立即失效并重新解析 runtime 配置，同时广播新的运行时选择事件。
     def refresh_runtime_config(self) -> LLMRuntime:
         """Refresh runtime config now and publish the canonical selection."""
         self.runtime_resolver.invalidate()
@@ -548,6 +632,8 @@ class AgentLoop:
         self._publish_runtime_selection(runtime)
         return runtime
 
+    # 解析某个会话应使用的 runtime：优先取会话上记录的模型预设名；
+    # 若该预设已被移除配置，按 recover_removed 决定是报错还是回退默认并清理会话元数据。
     def runtime_for_session(
         self,
         session: Session,
@@ -572,6 +658,7 @@ class AgentLoop:
             self.sessions.save(session)
             return self.llm_runtime()
 
+    # 校验预设名有效后，把它写入指定会话的元数据并持久化。
     def set_session_model_preset(
         self,
         session_key: str,
@@ -584,6 +671,7 @@ class AgentLoop:
         self.sessions.save(session)
         return runtime
 
+    # 把新选择的 runtime 广播给外部发布器与运行时事件总线（可通过 publish_update 抑制）。
     def _publish_runtime_selection(
         self,
         runtime: LLMRuntime,
@@ -599,6 +687,7 @@ class AgentLoop:
             runtime.model_preset,
         )
 
+    # 切换全局默认模型预设，供之后未显式指定 runtime 的回合使用。
     def set_model_preset(
         self,
         name: str | None,
@@ -616,14 +705,17 @@ class AgentLoop:
         )
         return runtime
 
+    # 在当前 provider 下切换具体模型（不涉及预设），供之后的回合使用。
     def set_runtime_model(self, model: str) -> LLMRuntime:
         """Select a model on the current provider for future turns."""
         return self.runtime_resolver.select_model(model)
 
+    # 单独调整上下文窗口大小，不改变模型/预设。
     def set_runtime_context_window(self, context_window_tokens: int) -> LLMRuntime:
         """Select a context limit for future turns."""
         return self.runtime_resolver.select_context_window(context_window_tokens)
 
+    # 通过插件加载器扫描并注册默认工具集，供本回合/所有会话使用。
     def _register_default_tools(
         self,
         *,
@@ -647,12 +739,17 @@ class AgentLoop:
             workspace_sandbox=self.workspace_scopes.sandbox_status,
             runtime_events=self.runtime_events,
             runtime_control=AgentRuntimeControl(self),
+            context_artifact_store=self.context_artifact_store,
+            context_artifact_page_token_budget=self.context_config.tool_result_token_budget,
+            schema_discovery=self.context_config.schema_discovery,
+            memory=self.context.memory,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
 
         logger.info("Registered {} tools: {}", len(registered), registered)
 
+    # 注册一个每回合都会被调用的运行时上下文提供者（去重），返回取消订阅函数。
     def register_runtime_context_provider(
         self,
         provider: RuntimeContextProvider,
@@ -662,24 +759,30 @@ class AgentLoop:
             return lambda: None
         self._runtime_context_providers.append(provider)
 
+        # 从提供者列表中移除自身，用于外部持有的取消订阅回调。
         def _unsubscribe() -> None:
             with suppress(ValueError):
                 self._runtime_context_providers.remove(provider)
 
         return _unsubscribe
 
+    # 提交一个 cron 触发的回合并等待其结果（用于同步等待场景）。
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         return await self._cron_turns.submit(msg)
 
+    # 提交一个本地触发器（local trigger）产生的回合并等待其结果。
     async def submit_local_trigger_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         return await self._local_trigger_turns.submit(msg)
 
+    # 查询某会话当前还有哪些 cron 任务处于“已提交待完成”状态。
     def pending_cron_job_ids_for_session(self, session_key: str) -> set[str]:
         return self._cron_turns.pending_job_ids_for_session(session_key)
 
+    # 查询某会话当前还有哪些本地触发器处于“已提交待完成”状态。
     def pending_local_trigger_ids_for_session(self, session_key: str) -> set[str]:
         return self._local_trigger_turns.pending_trigger_ids_for_session(session_key)
 
+    # 会话空闲下来后，把之前被递延的自动化回合（cron/本地触发器）重新发布到总线。
     async def _publish_next_deferred_automation_turn(self, session_key: str) -> None:
         await publish_next_deferred_turn(
             deferred_queues=self._deferred_automation_turns,
@@ -687,6 +790,8 @@ class AgentLoop:
             session_key=session_key,
         )
 
+    # 在回合真正开始处理前，把触发本回合的用户消息提前写入会话历史，
+    # 使取消/崩溃时也能在历史中看到用户的原始输入。
     def _persist_user_message_early(
         self,
         msg: InboundMessage,
@@ -730,6 +835,7 @@ class AgentLoop:
             return True
         return False
 
+    # 把已持久化历史与本回合新输入分别打包成 TranscriptInput，供 runner 组装 prompt。
     def _build_transcript_input(self, ctx: TurnContext) -> TranscriptInput:
         """Capture the persisted history and fresh input as separate transcript parts."""
         assert ctx.session is not None
@@ -741,6 +847,7 @@ class AgentLoop:
             runtime_context_blocks=ctx.runtime_context_blocks,
         )
 
+    # 为本回合构造 RequestContext（渠道/会话/工作区作用域等），供工具执行时通过 contextvar 读取。
     def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
         assert ctx.session is not None
         scope = self.workspace_scopes.for_turn(
@@ -762,6 +869,7 @@ class AgentLoop:
             workspace=scope.project_path,
         )
 
+    # 基于 TurnContext 汇总本回合的运行时上下文块（元数据中的、工具/全局提供者产出的、显式技能的）。
     async def _resolve_runtime_context_for_turn(
         self,
         ctx: TurnContext,
@@ -772,6 +880,8 @@ class AgentLoop:
             ctx.tools or self.tools,
         )
 
+    # 通用版本：给定任意 RequestContext/工具集，汇总所有运行时上下文提供者的输出。
+    # 供正常回合与 pending_queue 中的中途注入消息共用（见 _run_agent_loop._drain_pending）。
     async def _resolve_runtime_context_for_request(
         self,
         request: RequestContext,
@@ -790,6 +900,7 @@ class AgentLoop:
             blocks.append(skill_context)
         return blocks
 
+    # 在 run() 主循环中直接调度一个命令（不走完整的七阶段管线），并发布其结果。
     async def _dispatch_command_inline(
         self,
         msg: InboundMessage,
@@ -798,6 +909,7 @@ class AgentLoop:
         dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
     ) -> None:
         """Dispatch a command directly from the run() loop and publish the result."""
+        # 实际执行命令并把结果发布到出站总线的内部协程。
         async def dispatch_and_publish() -> None:
             ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
             result = await dispatch_fn(ctx)
@@ -813,6 +925,7 @@ class AgentLoop:
             return
         await dispatch_and_publish()
 
+    # 执行“!”前缀的受信用户 shell 命令：绑定该会话的工作区作用域与请求上下文后调用 exec 工具。
     async def execute_user_shell_command(self, ctx: CommandContext) -> OutboundMessage:
         """Execute one trusted user command with the active workspace policy."""
         metadata = dict(ctx.msg.metadata or {})
@@ -859,12 +972,14 @@ class AgentLoop:
             metadata={**metadata, "render_as": "text"},
         )
 
+    # 把新派发的任务加入该会话的活动任务集合，并注册完成回调以便自动清理。
     def _track_active_task(self, key: str, task: asyncio.Task[Any]) -> None:
         """Track active session work until its task group becomes empty."""
         tasks = self._active_tasks.setdefault(key, set())
         tasks.add(task)
         task.add_done_callback(partial(self._active_task_done, key, tasks))
 
+    # 任务完成后的清理回调：从集合中移除，若该会话已无活动任务则整体丢弃。
     def _active_task_done(
         self,
         key: str,
@@ -875,6 +990,7 @@ class AgentLoop:
         if not tasks and self._active_tasks.get(key) is tasks:
             self._active_tasks.pop(key, None)
 
+    # 取消并等待某会话下的全部活动任务、子代理与 exec 会话，返回取消总数。
     async def _cancel_active_tasks(self, key: str) -> int:
         """Cancel and await all active work for *key*.
 
@@ -889,6 +1005,7 @@ class AgentLoop:
         exec_cancelled = await self._exec_session_manager.terminate_by_owner(key)
         return cancelled + sub_cancelled + exec_cancelled
 
+    # 彻底丢弃一个会话：先标记为"正在丢弃"避免竞争，取消其活动工作，再清理文件状态。
     async def discard_session(self, key: str) -> None:
         """Stop active work for *key* and forget its cached session."""
         self._discarding_sessions.add(key)
@@ -899,16 +1016,19 @@ class AgentLoop:
             self.discard_session_file_state(key)
             self._discarding_sessions.discard(key)
 
+    # 单独清理某会话的临时文件读写状态（不涉及会话本身的持久化数据）。
     def discard_session_file_state(self, key: str) -> None:
         """Forget ephemeral file-read state for a reset or removed session."""
         self._file_state_store.discard(key)
 
+    # 计算用于任务路由/中途注入的会话 key：开启统一会话时（且无显式覆盖）折叠为同一个 key。
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    # 统一会话模式下，记住最近一次面向用户的真实渠道/会话，供后续主动投递消息使用。
     def _remember_unified_session_route(
         self,
         session: Session,
@@ -930,6 +1050,8 @@ class AgentLoop:
             return
         remember_last_channel(session.metadata, msg.channel, msg.chat_id)
 
+    # 驱动一次完整的 LLM+工具迭代循环：组装 AgentRunSpec 并委托给 AgentRunner.run，
+    # 同时定义中途注入、检查点回调等与会话/委托强相关的胶水逻辑（见下方三个内部函数）。
     async def _run_agent_loop(
         self,
         transcript_input: TranscriptInput,
@@ -961,10 +1083,21 @@ class AgentLoop:
         """
         self._sync_subagent_runtime_limits()
 
+        # 每完成一轮 LLM 交互（含工具调用），runner 都会回调这里把中间状态
+        # （provider_state 等）落盘为“运行中检查点”，用于回合被取消/进程重启后的恢复。
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
                 return
             public_payload = dict(payload)
+            existing_checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+            staged_summary = (
+                cast(dict[str, Any], existing_checkpoint).get(self._SUMMARY_CHECKPOINT_KEY)
+                if isinstance(existing_checkpoint, dict)
+                else None
+            )
+            if isinstance(staged_summary, dict):
+                public_payload[self._SUMMARY_CHECKPOINT_KEY] = staged_summary
+                public_payload[self._SUMMARY_CHECKPOINT_DELTA_KEY] = True
             private_state = public_payload.pop("provider_state", None)
             public_payload.pop(self._PROVIDER_STATE_CHECKPOINT_VERSION_KEY, None)
             if "provider_state" in payload and (
@@ -977,6 +1110,15 @@ class AgentLoop:
                 )
             self._set_runtime_checkpoint(session, public_payload)
 
+        async def _summary_checkpoint(checkpoint: SessionSummaryCheckpoint) -> None:
+            """Stage L4 durably without replacing the prior recovery payload."""
+            if session is None:
+                return
+            self._stage_summary_checkpoint(session, transcript_input, checkpoint)
+
+        # 当前回合执行期间，若同一会话又收到新消息（如用户追问、子代理完成事件），
+        # 不会打断当前回合，而是先塞进 pending_queue，这里在每轮工具调用之间
+        # 把队列里已经到达的消息“注入”进对话，实现同一会话内的中途消息合并。
         async def _drain_pending(
             *,
             limit: int = _MAX_INJECTIONS_PER_TURN,
@@ -986,6 +1128,8 @@ class AgentLoop:
             if pending_queue is None:
                 return []
 
+            # 把一条待注入的入站消息转换成 provider 可用的 user 消息 dict
+            # （解析图片附件、补充运行时上下文块、标记子代理结果/待确认的 followup id 等）。
             async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
                 content = pending_msg.content
                 image_paths = pending_msg.media if pending_msg.media else None
@@ -1066,6 +1210,9 @@ class AgentLoop:
 
         terminal_wait_deadline: float | None = None
 
+        # runner 判断“本回合已无更多工具调用，准备结束”时会调用这里：
+        # 如果该会话还有子代理在后台运行，就限时等待其结果注入，避免主回合
+        # 过早结束导致子代理的产出被孤立地当作新回合处理。
         async def _wait_for_pending(
             *,
             limit: int = _MAX_INJECTIONS_PER_TURN,
@@ -1130,6 +1277,8 @@ class AgentLoop:
         workspace_token = bind_workspace_scope(effective_scope)
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
+        # 若会话存在“持续目标”（sustained goal），生成一条提示模型继续工作或调用
+        # update_goal 完成的续写消息；供 continuation_callback 使用。
         def _goal_continue() -> str | None:
             _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
             if not _goal_lines:
@@ -1172,6 +1321,16 @@ class AgentLoop:
                 max_tool_result_chars=self.max_tool_result_chars,
                 transcript_input=transcript_input,
                 transcript_builder=transcript_builder,
+                context_source_collector=partial(
+                    self.context.collect_sources,
+                    channel=request_ctx.channel,
+                    workspace=effective_scope.project_path,
+                    include_memory=session.policy.persist if session is not None else True,
+                    tool_definitions=effective_tools.get_definitions(),
+                ),
+                context_config=self.context_config,
+                runtime_data_dir=self.runtime_data_dir,
+                artifact_store=self.context_artifact_store,
                 hook=hook,
                 concurrent_tools=True,
                 workspace=effective_scope.project_path,
@@ -1180,12 +1339,14 @@ class AgentLoop:
                 provider_retry_mode=self.provider_retry_mode,
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
+                summary_checkpoint_callback=_summary_checkpoint,
                 consolidate_history=(
                     partial(
                         self.consolidator.summarize_transcript,
                         runtime=runtime,
                         session_key=session.key,
                         tools=effective_tools.get_definitions(),
+                        structured_context=self.context_config.mode == "enforce",
                     )
                     if session is not None and not ephemeral
                     else None
@@ -1196,6 +1357,7 @@ class AgentLoop:
                         runtime=runtime,
                         session_key=session.key,
                         tools=effective_tools.get_definitions(),
+                        structured_context=self.context_config.mode == "enforce",
                     )
                     if session is not None and not ephemeral
                     else None
@@ -1217,6 +1379,7 @@ class AgentLoop:
                     message_metadata=request_metadata,
                 ),
                 provider_state=provider_state,
+                context_consumption=session.context_consumption if session is not None and not ephemeral else None,
                 llm_usage_source=source_from_request(
                     active_session_key,
                     channel=request_ctx.channel,
@@ -1230,6 +1393,7 @@ class AgentLoop:
             reset_file_states(file_state_token)
         if session is not None and not ephemeral:
             session.provider_state = result.provider_state
+            session.context_consumption = result.context_consumption
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             should_stream = turn_continuation.should_stream_budget_response(
@@ -1252,6 +1416,7 @@ class AgentLoop:
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
         return result
 
+    # 按配置的时间间隔限流地扫描空闲会话，触发自动压缩/清理（避免每次 timeout 都全量扫描）。
     def _check_expired_sessions_if_due(self) -> None:
         """Scan idle sessions no more often than the configured interval."""
         now = time.monotonic()
@@ -1264,8 +1429,12 @@ class AgentLoop:
             active_session_keys=self._pending_queues.keys(),
         )
 
+    # 对外唯一的长驻入口：持续从消息总线取消息并派发，直到 stop() 被调用。
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
+        # 主消费循环：从消息总线取入站消息 -> 决定路由方式 -> 派发。
+        # 每条消息都作为独立 asyncio.Task 派发（而不是 await 处理完再取下一条），
+        # 这样 /stop 等命令可以随时打断某个会话的任务，而不阻塞其他会话。
         self._running = True
         try:
             logger.info("Agent loop started")
@@ -1342,6 +1511,8 @@ class AgentLoop:
                 # If this session already has an active pending queue (i.e. a task
                 # is processing this session), route the message there for mid-turn
                 # injection instead of creating a competing task.
+                # 该会话已有一个任务在处理中（存在 pending_queue），
+                # 新消息不再创建新任务，而是注入到该任务的中途消息队列中。
                 if effective_key in self._pending_queues:
                     # Non-priority commands must not be queued for injection;
                     # dispatch them directly (same pattern as priority commands).
@@ -1384,6 +1555,8 @@ class AgentLoop:
         finally:
             await self.aclose()
 
+    # 供 gateway 关闭流程调用：告知本 loop 在被取消时保留运行检查点，
+    # 而不是像普通 /stop 一样把部分内容物化，以便 RecoveryCoordinator 之后安全续跑。
     def preserve_inflight_turns_on_shutdown(self) -> None:
         """Keep durable checkpoints when the owning gateway exits.
 
@@ -1394,8 +1567,13 @@ class AgentLoop:
         """
         self._preserve_inflight_turns_on_shutdown = True
 
+    # run() 派发出的每个任务的实际执行体：持有会话锁与并发闸门，调用 _process_message，
+    # 并处理取消/异常/清理与递延队列补发（是回合级容错的核心位置）。
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
+        # 同一会话内的回合通过 lock 串行执行；不同会话之间并发（受 gate 限流）。
+        # pending_queue 在持锁期间创建并注册到 self._pending_queues，
+        # 使后续同会话消息能被 run() 路由为“注入”而不是新任务。
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
@@ -1531,6 +1709,7 @@ class AgentLoop:
                 await delivery.idle()
                 await self._publish_next_deferred_automation_turn(session_key)
 
+    # 对外关闭入口：加锁防止 run() 的自关闭与外部触发的关闭并发执行同一套清理逻辑。
     async def aclose(self) -> None:
         """Stop active work, then close resources owned by the agent loop.
 
@@ -1539,6 +1718,8 @@ class AgentLoop:
         phase in ``finally`` prevents a timed-out background task from leaving
         subprocess transports alive after the event loop closes.
         """
+        # 关闭入口：取消所有活动任务/后台任务，再依次释放子代理管理器、
+        # exec 会话管理器等资源；用锁防止 run() 的自关闭与外部关闭并发执行。
         # The loop closes itself from ``run()`` while application shutdown also
         # performs a guaranteed final close. Serialize those owners so they cannot
         # tear down the same resources concurrently.
@@ -1548,6 +1729,8 @@ class AgentLoop:
         async with close_lock:
             await self._aclose_unlocked()
 
+    # 实际执行关闭：取消并等待所有活动/后台任务，再依次释放子代理与 exec 会话资源；
+    # 汇总过程中的异常，最终以单个异常或 BaseExceptionGroup 的形式抛出。
     async def _aclose_unlocked(self) -> None:
         errors: list[BaseException] = []
         active_task_groups = getattr(self, "_active_tasks", {})
@@ -1582,17 +1765,21 @@ class AgentLoop:
         if errors:
             raise BaseExceptionGroup("failed to close agent resources", errors)
 
+    # 把协程作为“后台任务”调度：加入跟踪集合，关闭时会被 _aclose_unlocked 一并等待/取消。
     def schedule_background(self, coro: Coroutine[Any, Any, Any]) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    # 请求停止主循环：仅置位标志，真正的收尾发生在 run() 的 finally -> aclose()。
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
 
+    # 单条入站消息的完整处理入口：构造 TurnContext 后按 restore/compact/command/
+    # build/run/save/respond 七个阶段顺序驱动整个回合（见文件顶部 TurnContext 说明）。
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1680,12 +1867,15 @@ class AgentLoop:
                     pass
             segment_streamed_content = False
 
+            # 包一层 on_stream：记录本段是否真正流出过内容，供 _tracked_stream_end 判断。
             async def _tracked_stream(delta: str) -> None:
                 nonlocal segment_streamed_content
                 if delta:
                     segment_streamed_content = True
                 await stream_callback(delta)
 
+            # 包一层 on_stream_end：把“本段是否流式输出过内容”写回 ctx.streamed_content，
+            # 并按底层回调是否支持 merge_next 参数选择性传递。
             async def _tracked_stream_end(
                 *,
                 resuming: bool = False,
@@ -1703,6 +1893,10 @@ class AgentLoop:
             ctx.on_stream = _tracked_stream
             ctx.on_stream_end = _tracked_stream_end
 
+        # 回合处理的七个阶段，按顺序执行：
+        # restore（恢复会话/检查点）-> compact（会话压缩）
+        # -> command（斜杠命令短路，命中则直接返回）-> build（组装 prompt/上下文）
+        # -> run（驱动 LLM 与工具循环）-> save（持久化回合结果）-> respond（组装出站消息）。
         await self._run_turn_stage(ctx, "restore", self._restore_turn)
         await self._run_turn_stage(ctx, "compact", self._compact_session)
         if await self._run_turn_stage(ctx, "command", self._dispatch_command):
@@ -1713,6 +1907,7 @@ class AgentLoop:
         await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
         return ctx.outbound
 
+    # 统一包裹七个阶段处理函数：记录每阶段耗时，失败/成功都打调试日志，便于定位慢阶段。
     async def _run_turn_stage(
         self,
         ctx: TurnContext,
@@ -1740,6 +1935,8 @@ class AgentLoop:
         )
         return result
 
+    # 把 RUN 阶段的最终文本包装成 OutboundMessage：按会话策略决定是否记录内容日志，
+    # 流式且非错误结束时打上 StreamedResponseEvent 标记，把延迟写入 metadata。
     def _assemble_outbound(
         self,
         msg: InboundMessage,
@@ -1772,6 +1969,8 @@ class AgentLoop:
             metadata=meta,
         )
 
+    # 阶段一（RESTORE）：取得/创建会话，应用工具白名单策略，
+    # 并恢复上一次未完成回合留下的运行检查点或中断标记。
     async def _restore_turn(self, ctx: TurnContext) -> None:
         """Restore checkpoint / pending user turn; reference non-image attachments."""
         msg = ctx.msg
@@ -1828,6 +2027,8 @@ class AgentLoop:
         ):
             self.sessions.save(session)
 
+    # 阶段二（COMPACT）：若会话历史超出阈值，在此触发/沿用一次摘要压缩，
+    # 产出的 pending_summary 会在 BUILD 阶段拼入 transcript。
     async def _compact_session(self, ctx: TurnContext) -> None:
         session = ctx.require_session()
         ctx.session, pending = self.auto_compact.prepare_session(
@@ -1836,6 +2037,8 @@ class AgentLoop:
         )
         ctx.pending_summary = pending
 
+    # 阶段三（COMMAND）：斜杠命令在此短路处理，命中后跳过 BUILD/RUN，
+    # 直接落盘命令结果并返回 True，交由 _process_message 提前结束回合。
     async def _dispatch_command(self, ctx: TurnContext) -> bool:
         if ctx.kind is TurnKind.SYSTEM or ctx.msg.channel == "system":
             return False
@@ -1885,6 +2088,9 @@ class AgentLoop:
             return True
         return False
 
+    # 阶段四（BUILD）：确定本回合使用的 runtime（模型/预设），取出历史，
+    # 处理子代理结果的"提前持久化"，解析运行时上下文块，并把当前用户消息
+    # 早写入会话（early persist），最终产出 transcript_input 供 RUN 阶段使用。
     async def _build_turn(self, ctx: TurnContext) -> None:
         session = ctx.require_session()
         runtime = ctx.runtime
@@ -1998,6 +2204,8 @@ class AgentLoop:
         if ctx.on_retry_wait is None:
             ctx.on_retry_wait = ctx.delivery.retry_wait_callback()
 
+    # 阶段五（RUN）：调用 _run_agent_loop 驱动 LLM+工具循环，
+    # 并把结果（最终文本、消息列表、usage、是否需要抑制回复等）写回 ctx。
     async def _run_turn(self, ctx: TurnContext) -> None:
         runtime = ctx.require_runtime()
         if ctx.visible_run_started_at is None:
@@ -2039,6 +2247,8 @@ class AgentLoop:
         if ctx.kind is TurnKind.USER:
             await turn_continuation.maybe_continue_turn(ctx)
 
+    # 阶段六（SAVE）：把 RUN 阶段产出的新消息落盘到会话历史，
+    # 计算回合延迟，清理运行检查点/待处理标记，并广播"回合已持久化"事件。
     async def _persist_turn(self, ctx: TurnContext) -> None:
         session = ctx.require_session()
         turn_continuation.prepare_save_boundary(ctx)
@@ -2088,6 +2298,8 @@ class AgentLoop:
                 attributes=ctx.attributes,
             )
 
+    # 阶段七（RESPOND）：根据回合类型（用户/系统）与是否需要抑制回复，
+    # 组装最终返回给通道的 OutboundMessage。
     async def _prepare_outbound(self, ctx: TurnContext) -> None:
         if ctx.suppress_response:
             ctx.outbound = None
@@ -2111,6 +2323,7 @@ class AgentLoop:
         if ctx.ephemeral and ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
 
+    # 落盘前清洗多模态内容块：把 base64 图片替换为占位文本，超长文本按需截断。
     def _sanitize_persisted_blocks(
         self,
         content: list[object],
@@ -2150,6 +2363,7 @@ class AgentLoop:
 
         return filtered
 
+    # 把一条摘要压缩的替代记录插入会话消息列表，并写入隐藏边界提示与最新摘要元数据。
     @staticmethod
     def _insert_summary_checkpoint(
         session: Session,
@@ -2170,12 +2384,16 @@ class AgentLoop:
         else:
             session.messages.insert(insert_at, hint)
             checkpoint_session_index = insert_at
-        session.metadata["_last_summary"] = {
+        summary_metadata: dict[str, Any] = {
             "text": checkpoint.summary,
             "last_active": session.updated_at.isoformat(),
         }
+        if checkpoint.structured is not None:
+            summary_metadata["structured"] = checkpoint.structured
+        session.metadata["_last_summary"] = summary_metadata
         session.last_archived = checkpoint_session_index
 
+    # 校验摘要检查点的边界是否落在本回合新消息范围内，越界则丢弃并告警（防止跨回合污染）。
     @staticmethod
     def _validated_checkpoint_boundary(
         checkpoint: SessionSummaryCheckpoint | None,
@@ -2188,17 +2406,20 @@ class AgentLoop:
         if checkpoint is None:
             return None
         boundary = checkpoint.transcript_boundary
-        if skip - 1 <= boundary <= message_count:
+        minimum = 1 if checkpoint.structured is not None else skip - 1
+        if minimum <= boundary <= message_count:
             return boundary
         logger.warning(
             "Ignoring invalid summary boundary {} outside [{}, {}] for {}",
             boundary,
-            skip - 1,
+            minimum,
             message_count,
             session_key,
         )
         return None
 
+    # 把本回合新产生的消息逐条落盘：校验 tool/assistant 配对、清洗多模态内容、
+    # 截断超长文本、在正确位置插入摘要检查点，并记录延迟与已确认的 followup id。
     def _save_turn(
         self,
         session: Session,
@@ -2210,6 +2431,9 @@ class AgentLoop:
         input_persisted_early: bool = False,
     ) -> None:
         """Commit new-turn messages and an optional summary boundary."""
+        # declared_tool_call_ids / fulfilled_tool_call_ids 用于校验 tool 消息与其
+        # 对应的 assistant.tool_calls 是否配对完整——不配对的 tool 结果会污染
+        # provider 的下一次请求，必须在落盘前丢弃（见下方 role == "tool" 分支）。
         declared_tool_call_ids = {
             str(tc["id"])
             for m in session.messages
@@ -2232,6 +2456,20 @@ class AgentLoop:
             message_count=len(messages),
             session_key=session.key,
         )
+
+        if (
+            summary_checkpoint is not None
+            and checkpoint_boundary is not None
+            and checkpoint_boundary < skip - 1
+        ):
+            trailing_persisted = skip - checkpoint_boundary
+            if not input_persisted_early:
+                trailing_persisted = max(0, trailing_persisted - 1)
+            self._insert_summary_checkpoint(
+                session,
+                summary_checkpoint,
+                insert_at=max(0, len(session.messages) - trailing_persisted),
+            )
 
         # The trigger input may already be the session tail while still being
         # the first message after the replacement checkpoint.
@@ -2289,12 +2527,19 @@ class AgentLoop:
                     )
                     continue
                 fulfilled_tool_call_ids.add(tool_call_id_str)
-                if isinstance(content, str) and len(content) > self.max_tool_result_chars:
+                context_config = getattr(self, "context_config", None)
+                should_truncate_text = context_config is None or context_config.mode != "enforce"
+                if not should_truncate_text and isinstance(internal_meta, dict):
+                    tool_result_error = cast(dict[str, Any], internal_meta).get("tool_result_error")
+                    if isinstance(tool_result_error, bool):
+                        entry["_meta"] = {"tool_result_error": tool_result_error}
+                if (should_truncate_text and isinstance(content, str)
+                        and len(content) > self.max_tool_result_chars):
                     entry["content"] = truncate_text_fn(content, self.max_tool_result_chars)
                 elif isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(
                         cast(list[object], content),
-                        should_truncate_text=True,
+                        should_truncate_text=should_truncate_text,
                     )
                     if not filtered:
                         # Preserve the tool_call/result pair after block filtering.
@@ -2336,6 +2581,8 @@ class AgentLoop:
             acknowledge_pending_followups(session, saved_followup_ids)
         session.updated_at = datetime.now()
 
+    # 在组装 prompt 前把子代理的完成结果落盘为一条 assistant 记录，
+    # 按 subagent_task_id 去重，避免同一结果被重复写入历史。
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
         """Persist subagent follow-ups before prompt assembly so history stays durable.
 
@@ -2365,21 +2612,187 @@ class AgentLoop:
         )
         return True
 
+    def _stage_summary_checkpoint(
+        self,
+        session: Session,
+        transcript_input: TranscriptInput,
+        checkpoint: SessionSummaryCheckpoint,
+    ) -> int:
+        """Atomically stage an L4 checkpoint and return its session insertion point."""
+        had_previous = self._RUNTIME_CHECKPOINT_KEY in session.metadata
+        previous = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+        payload = dict(cast(dict[str, Any], previous)) if isinstance(previous, dict) else {}
+        history_count = len(transcript_input.history)
+        current_persisted = bool(session.metadata.get(self._PENDING_USER_TURN_KEY))
+        history_start = max(
+            0,
+            len(session.messages) - history_count - (1 if current_persisted else 0),
+        )
+        covered_history = min(max(checkpoint.transcript_boundary - 1, 0), history_count)
+        session_insert_at = (
+            history_start + covered_history
+            if checkpoint.transcript_boundary <= history_count + 1
+            else len(session.messages)
+        )
+        payload[self._SUMMARY_CHECKPOINT_KEY] = {
+            "version": self._SUMMARY_CHECKPOINT_VERSION,
+            "text": checkpoint.summary,
+            "structured": checkpoint.structured,
+            "transcript_boundary": checkpoint.transcript_boundary,
+            "session_insert_at": session_insert_at,
+        }
+        payload[self._SUMMARY_CHECKPOINT_DELTA_KEY] = False
+        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
+        try:
+            self.sessions.save_runtime_checkpoint(session)
+        except Exception:
+            if had_previous:
+                session.metadata[self._RUNTIME_CHECKPOINT_KEY] = previous
+            else:
+                session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+            raise
+        return session_insert_at
+
+    # 把正在进行中的回合状态写入会话元数据，供取消/重启后恢复（见 restore_runtime_checkpoint）。
     def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
         """Persist the latest in-flight turn state into session metadata."""
         session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
         self.sessions.save_runtime_checkpoint(session)
 
+    # 标记该会话有一条用户消息已提前持久化但回合尚未完成。
     def _mark_pending_user_turn(self, session: Session) -> None:
         session.metadata[self._PENDING_USER_TURN_KEY] = True
 
+    # 清除“用户消息已提前持久化但回合未完成”的标记。
     def _clear_pending_user_turn(self, session: Session) -> None:
         session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
 
+    # 回合正常结束后清理运行检查点，避免下次误恢复为“未完成”状态。
     def _clear_runtime_checkpoint(self, session: Session) -> None:
         if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
             session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
 
+    async def compact_session_context(self, session_key: str) -> ContextCompactionResult:
+        """Explicitly compact only host-proven accepted H through Governor L4."""
+        session_lock = self._get_session_lock(session_key)
+        consolidation_lock = self.consolidator.get_lock(session_key)
+        async with session_lock, consolidation_lock:
+            return await self._compact_session_context_locked(session_key)
+
+    async def _compact_session_context_locked(
+        self,
+        session_key: str,
+    ) -> ContextCompactionResult:
+        """Run explicit L4 while the turn and consolidation locks are held."""
+        session = self.sessions.get_or_create(session_key)
+        if session.context_consumption is None:
+            return ContextCompactionResult(False, "no_accepted_history")
+        runtime = self.runtime_for_session(session)
+        channel, workspace = PersistedPromptContextResolver(
+            workspace_scopes=self.workspace_scopes,
+            unified_session=self._unified_session,
+        )(session)
+        history = session.get_history()
+        summary = session_summary_from_metadata(
+            session.metadata,
+            fallback_last_active=session.updated_at,
+        )
+        transcript_input = TranscriptInput(
+            history=history,
+            current_message=None,
+            session_summary=summary,
+        )
+        transcript_builder = partial(
+            self.context.build_transcript,
+            channel=channel,
+            workspace=workspace,
+            include_memory=session.policy.persist,
+        )
+        tool_definitions = self.tools.get_definitions()
+        messages, compaction = ContextCompactionState.from_transcript(
+            transcript_input,
+            transcript_builder,
+            partial(
+                self.consolidator.summarize_transcript,
+                runtime=runtime,
+                session_key=session.key,
+                tools=tool_definitions,
+                structured_context=True,
+            ),
+            None,
+            consumption=session.context_consumption,
+            track_consumption=True,
+        )
+        if compaction is None or not compaction.accepted_messages:
+            return ContextCompactionResult(False, "no_accepted_history")
+
+        insertion_points: list[int] = []
+
+        async def _commit(checkpoint: SessionSummaryCheckpoint) -> None:
+            insertion_points.append(
+                self._stage_summary_checkpoint(session, transcript_input, checkpoint)
+            )
+
+        config = ContextGovernanceConfig(
+            provider=runtime.provider,
+            model=runtime.model,
+            tools=self.tools,
+            workspace=workspace,
+            session_key=session.key,
+            max_tool_result_chars=self.max_tool_result_chars,
+            context_window_tokens=runtime.context_window_tokens,
+            context_block_limit=self.context_block_limit,
+            max_tokens=runtime.generation.max_tokens,
+            context=self.context_config,
+            runtime_data_dir=self.runtime_data_dir,
+            artifact_store=self.context_artifact_store,
+            summary_checkpoint_commit=_commit,
+        )
+        state = ModelRequestState(
+            config=config,
+            conversation=ProviderConversationStateController(
+                provider=runtime.provider,
+                model=runtime.model,
+                messages=messages,
+                state=session.provider_state,
+                session_id=session.key,
+            ),
+            compaction=compaction,
+        )
+        result = await self.runner.context_governor.compact_accepted_history(
+            state,
+            compaction.request_messages(messages),
+            tool_definitions=tool_definitions,
+        )
+        if not result.applied or result.checkpoint is None or not insertion_points:
+            return result
+
+        previous_messages = list(session.messages)
+        previous_metadata = deepcopy(session.metadata)
+        previous_last_archived = session.last_archived
+        previous_provider_state = session.provider_state
+        previous_consumption = session.context_consumption
+        try:
+            self._insert_summary_checkpoint(
+                session,
+                result.checkpoint,
+                insert_at=insertion_points[-1],
+            )
+            session.provider_state = None
+            session.context_consumption = None
+            self._clear_runtime_checkpoint(session)
+            self.sessions.save(session)
+        except Exception:
+            session.messages = previous_messages
+            session.metadata = previous_metadata
+            session.last_archived = previous_last_archived
+            session.provider_state = previous_provider_state
+            session.context_consumption = previous_consumption
+            raise
+        return result
+
+    # 供 CLI / SDK 等非渠道场景直接调用：构造一条 InboundMessage，
+    # 与总线派发共享同一把会话锁，再走 _process_message 完整管线。
     async def process_direct(
         self,
         content: str,
@@ -2444,6 +2857,7 @@ class AgentLoop:
             await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
             self.runtime_event_publisher.clear_turn(session_key)
 
+    # 获取（或创建）某会话的串行锁；用 WeakValueDictionary 存储，空闲会话的锁可被 GC 自动回收。
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared lock while allowing idle session entries to expire."""
         lock = self._session_locks.get(session_key)

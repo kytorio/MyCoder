@@ -564,6 +564,96 @@ def test_save_turn_commits_summary_boundary_without_rewriting_raw_history() -> N
     ]
 
 
+def test_save_turn_commits_structured_l4_before_existing_unaccepted_delta() -> None:
+    loop = _mk_loop()
+    session = Session(
+        key="test:historical-summary-boundary",
+        messages=[
+            {"role": "user", "content": "accepted"},
+            {"role": "assistant", "content": "prior unaccepted delta"},
+            {"role": "user", "content": "current input"},
+        ],
+    )
+    structured = {
+        "schema_version": 1,
+        "tasks": ["Continue"],
+        "constraints": [],
+        "explicit_preferences": [],
+        "decisions": [],
+        "file_changes": [],
+        "errors": [],
+        "evidence_refs": [],
+        "remaining_work": ["Answer current input"],
+    }
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "accepted"},
+            {"role": "assistant", "content": "prior unaccepted delta"},
+            {"role": "user", "content": "current input"},
+            {"role": "assistant", "content": "done"},
+        ],
+        skip=4,
+        summary_checkpoint=SessionSummaryCheckpoint(
+            summary="Structured checkpoint.",
+            transcript_boundary=2,
+            structured=structured,
+        ),
+        input_persisted_early=True,
+    )
+
+    assert [message["content"] for message in session.messages] == [
+        "accepted",
+        SUMMARY_CONTINUATION_TEXT,
+        "prior unaccepted delta",
+        "current input",
+        "done",
+    ]
+    assert session.last_archived == 1
+    assert session.metadata["_last_summary"]["structured"] == structured
+
+
+def test_summary_sidecar_failure_restores_previous_runtime_checkpoint() -> None:
+    loop = _mk_loop()
+    previous = {"phase": "tools_completed", "marker": "keep"}
+    session = Session(
+        key="test:summary-stage-failure",
+        messages=[{"role": "user", "content": "accepted"}],
+        metadata={RUNTIME_CHECKPOINT_KEY: previous},
+    )
+    loop.sessions = SimpleNamespace(  # type: ignore[assignment]
+        save_runtime_checkpoint=MagicMock(side_effect=OSError("disk unavailable"))
+    )
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        loop._stage_summary_checkpoint(
+            session,
+            TranscriptInput(
+                history=[{"role": "user", "content": "accepted"}],
+                current_message=None,
+            ),
+            SessionSummaryCheckpoint(
+                summary="checkpoint",
+                transcript_boundary=2,
+                structured={
+                    "schema_version": 1,
+                    "tasks": [],
+                    "constraints": [],
+                    "explicit_preferences": [],
+                    "decisions": [],
+                    "file_changes": [],
+                    "errors": [],
+                    "evidence_refs": [],
+                    "remaining_work": [],
+                },
+            ),
+        )
+
+    assert session.metadata[RUNTIME_CHECKPOINT_KEY] is previous
+
+
 def test_save_turn_acknowledges_every_merged_recovery_followup() -> None:
     """Persisting a merged injected row retires every durable follow-up ID."""
     loop = _mk_loop()

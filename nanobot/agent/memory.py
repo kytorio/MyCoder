@@ -13,13 +13,24 @@ import os
 import re
 import threading
 import weakref
+from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 from loguru import logger
 
+from nanobot.agent.context_plan import (
+    ContextSummaryCandidate,
+    StructuredContextSummary,
+    render_context_summary,
+)
+from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.llm_usage.context import llm_usage_source
 from nanobot.providers.base import ProviderCallContext, ProviderConversationState
 from nanobot.runtime_context import public_history_messages
@@ -37,6 +48,7 @@ from nanobot.utils.helpers import (
     strip_think,
     truncate_text,
     truncate_text_to_tokens,
+    write_text_atomic,
 )
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.workspace_prompts import (
@@ -47,7 +59,12 @@ from nanobot.utils.workspace_prompts import (
 )
 
 if TYPE_CHECKING:
-    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.agent.memory_writes import (
+        MemoryCommitResult,
+        MemoryRememberRequested,
+        MemoryTarget,
+        MemoryWriteCoordinator,
+    )
     from nanobot.utils.llm_runtime import LLMRuntime
 
 # ---------------------------------------------------------------------------
@@ -69,7 +86,13 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(
+        self,
+        workspace: Path,
+        max_history_entries: int = _DEFAULT_MAX_HISTORY,
+        *,
+        writer: MemoryWriteCoordinator | None = None,
+    ):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
         self.memory_dir = ensure_dir(workspace / "memory")
@@ -85,6 +108,7 @@ class MemoryStore:
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._dream_prompt_oversize_logged = False
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
+        self.writer = writer
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
         ])
@@ -226,11 +250,24 @@ class MemoryStore:
 
     # -- MEMORY.md (long-term facts) -----------------------------------------
 
-    def read_memory(self) -> str:
-        return self.read_file(self.memory_file)
+    def read_memory(self, *, project: Path | None = None) -> str:
+        content = self.read_file(self.memory_file)
+        if project is None or not content:
+            return content
+        from nanobot.agent.memory_writes import (
+            memory_instance_id,
+            memory_project_id,
+            visible_memory_content,
+        )
+
+        return visible_memory_content(
+            content,
+            instance_id=memory_instance_id(self.workspace),
+            project_id=memory_project_id(project),
+        )
 
     def write_memory(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        self._write_canonical("memory", content)
 
     # -- SOUL.md -------------------------------------------------------------
 
@@ -238,7 +275,7 @@ class MemoryStore:
         return self.read_file(self.soul_file)
 
     def write_soul(self, content: str) -> None:
-        self.soul_file.write_text(content, encoding="utf-8")
+        self._write_canonical("soul", content)
 
     # -- USER.md -------------------------------------------------------------
 
@@ -246,12 +283,41 @@ class MemoryStore:
         return self.read_file(self.user_file)
 
     def write_user(self, content: str) -> None:
-        self.user_file.write_text(content, encoding="utf-8")
+        self._write_canonical("user", content)
+
+    def _write_canonical(self, target: MemoryTarget, content: str) -> None:
+        """Preserve the synchronous API while enforcing managed-entry protection."""
+        if self.writer is None:
+            path = {
+                "memory": self.memory_file,
+                "soul": self.soul_file,
+                "user": self.user_file,
+            }[target]
+            write_text_atomic(path, content)
+            return
+        from nanobot.agent.memory_writes import MemoryConflictError
+
+        result = self.writer.replace_file(target, content, source="sdk")
+        if result.status == "conflict":
+            raise MemoryConflictError(result.reason_code or "memory_conflict")
+        if result.status != "committed":
+            raise OSError(result.reason_code or "memory_write_failed")
+
+    def remember(self, request: MemoryRememberRequested) -> MemoryCommitResult:
+        """Commit an explicit request through the configured recoverable writer."""
+        if self.writer is None:
+            from nanobot.agent.memory_writes import MemoryWriteUnavailableError
+
+            raise MemoryWriteUnavailableError("memory_writer_unavailable")
+        from nanobot.agent.memory_writes import build_explicit_mutation
+
+        base = self.writer.snapshot()
+        return self.writer.commit(build_explicit_mutation(request, base))
 
     # -- context injection (used by context.py) ------------------------------
 
-    def get_memory_context(self) -> str:
-        long_term = self.read_memory()
+    def get_memory_context(self, *, project: Path | None = None) -> str:
+        long_term = self.read_memory(project=project)
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
@@ -502,7 +568,9 @@ class MemoryStore:
         return 0
 
     def set_last_dream_cursor(self, cursor: int) -> None:
-        self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
+        if cursor < 0:
+            raise ValueError("dream cursor must be non-negative")
+        write_text_atomic(self._dream_cursor_file, str(cursor), newline="")
 
     def get_latest_cursor(self) -> int:
         return max(self._next_cursor() - 1, 0)
@@ -572,15 +640,202 @@ class MemoryStore:
             return ""
         return self._git.summarize_working_tree(list(self._DREAM_CONTENT_PATHS))
 
+    @staticmethod
+    def _canonical_relative_path(target: MemoryTarget) -> str:
+        return {
+            "user": "USER.md",
+            "soul": "SOUL.md",
+            "memory": "memory/MEMORY.md",
+        }[target]
+
+    def _canonical_target_for_path(self, path: Path) -> MemoryTarget | None:
+        candidate = Path(os.path.abspath(path))
+        for target in ("user", "soul", "memory"):
+            canonical = Path(
+                os.path.abspath(self.workspace / self._canonical_relative_path(target))
+            )
+            if candidate == canonical:
+                return target
+        return None
+
+    def _dream_file_bases(self) -> dict[MemoryTarget, _DreamFileBase]:
+        contents: Mapping[MemoryTarget, str]
+        if self.writer is not None:
+            contents = self.writer.snapshot().contents
+        else:
+            contents = {
+                "user": self.read_user(),
+                "soul": self.read_soul(),
+                "memory": self.read_memory(),
+            }
+        return {
+            target: _DreamFileBase(
+                content=contents[target],
+                exists=(self.workspace / self._canonical_relative_path(target)).exists(),
+            )
+            for target in ("user", "soul", "memory")
+        }
+
+    def _commit_dream_files(
+        self,
+        bases: dict[MemoryTarget, str],
+        proposed: dict[MemoryTarget, str],
+    ) -> tuple[bool, str | None]:
+        """Merge and commit one Dream tool call, retrying one version race."""
+        from nanobot.agent.memory_writes import (
+            MemoryConflictError,
+            MemoryMutation,
+            merge_unmanaged_text,
+        )
+
+        attempts = 2 if self.writer is not None else 1
+        for attempt in range(attempts):
+            try:
+                if self.writer is not None:
+                    latest = self.writer.snapshot()
+                    current: dict[MemoryTarget, str] = dict(latest.contents)
+                    base_revision = latest.revision
+                else:
+                    current = {
+                        "user": self.read_user(),
+                        "soul": self.read_soul(),
+                        "memory": self.read_memory(),
+                    }
+                    base_revision = "legacy"
+                merged: dict[MemoryTarget, str] = dict(current)
+                for target, candidate in proposed.items():
+                    merged[target] = merge_unmanaged_text(
+                        bases[target],
+                        current[target],
+                        candidate,
+                    )
+            except MemoryConflictError as exc:
+                return False, exc.reason_code
+
+            if self.writer is None:
+                for target in proposed:
+                    path = self.workspace / self._canonical_relative_path(target)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    write_text_atomic(path, merged[target], newline="")
+                return True, None
+            if merged == current:
+                return True, None
+            identity = json.dumps(
+                {"base_revision": base_revision, "proposed": merged},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            result = self.writer.commit(
+                MemoryMutation(
+                    operation_id=f"dream:{sha256(identity.encode()).hexdigest()[:32]}",
+                    source="dream",
+                    base_revision=base_revision,
+                    proposed_files=merged,
+                )
+            )
+            if result.status == "committed":
+                return True, None
+            if result.reason_code == "base_revision_conflict" and attempt == 0:
+                continue
+            return False, result.reason_code or "dream_memory_commit_failed"
+        return False, "base_revision_conflict"
+
+    def restore_dream_version(self, commit: str) -> MemoryCommitResult | None:
+        """Apply a Dream parent-tree candidate only after protected-entry checks."""
+        from nanobot.agent.memory_writes import (
+            MemoryCommitResult,
+            MemoryConflictError,
+            MemoryMutation,
+            validate_protected_entries_preserved,
+        )
+
+        candidate = self.git.read_revert_candidate(commit, message_prefix="dream:")
+        if candidate is None:
+            return None
+        _committed_files, parent_files = candidate
+        cursor_text = parent_files.get("memory/.dream_cursor", "0").strip() or "0"
+        try:
+            cursor = int(cursor_text)
+            if cursor < 0:
+                raise ValueError
+        except ValueError:
+            return MemoryCommitResult(
+                operation_id=f"restore:{commit}",
+                status="conflict",
+                revision="unknown",
+                entry_ids=(),
+                reason_code="invalid_dream_cursor",
+            )
+
+        for attempt in range(2 if self.writer is not None else 1):
+            if self.writer is not None:
+                latest = self.writer.snapshot()
+                current: dict[MemoryTarget, str] = dict(latest.contents)
+                revision = latest.revision
+            else:
+                current = {
+                    "user": self.read_user(),
+                    "soul": self.read_soul(),
+                    "memory": self.read_memory(),
+                }
+                revision = "legacy"
+            proposed: dict[MemoryTarget, str] = dict(current)
+            try:
+                for target in ("user", "soul", "memory"):
+                    restored = parent_files.get(
+                        self._canonical_relative_path(target),
+                        "",
+                    )
+                    validate_protected_entries_preserved(current[target], restored)
+                    proposed[target] = restored
+            except MemoryConflictError as exc:
+                return MemoryCommitResult(
+                    operation_id=f"restore:{commit}",
+                    status="conflict",
+                    revision=revision,
+                    entry_ids=(),
+                    reason_code=exc.reason_code,
+                )
+
+            operation_id = f"restore:{commit}:{sha256(json.dumps(proposed, sort_keys=True).encode()).hexdigest()[:24]}"
+            if self.writer is None:
+                for target in ("user", "soul", "memory"):
+                    self._write_canonical(target, proposed[target])
+                result = MemoryCommitResult(
+                    operation_id=operation_id,
+                    status="committed",
+                    revision=revision,
+                    entry_ids=(),
+                )
+            else:
+                result = self.writer.commit(
+                    MemoryMutation(
+                        operation_id=operation_id,
+                        source="restore",
+                        base_revision=revision,
+                        proposed_files=proposed,
+                    )
+                )
+                if result.reason_code == "base_revision_conflict" and attempt == 0:
+                    continue
+            if result.status == "committed":
+                self.set_last_dream_cursor(cursor)
+            return result
+        return MemoryCommitResult(
+            operation_id=f"restore:{commit}",
+            status="conflict",
+            revision="unknown",
+            entry_ids=(),
+            reason_code="base_revision_conflict",
+        )
+
     def build_dream_tools(self) -> ToolRegistry:
         """Build the restricted tool registry used by Dream runs."""
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.apply_patch import ApplyPatchTool
         from nanobot.agent.tools.file_state import FileStates
         from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
-        from nanobot.agent.tools.registry import ToolRegistry
-
-        tools = ToolRegistry()
         file_states = FileStates()
         workspace = self.workspace
         skills_dir = workspace / "skills"
@@ -588,32 +843,38 @@ class MemoryStore:
 
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
         editable_files = [self.memory_file, self.soul_file, self.user_file]
+        state = _DreamWriteState(self._dream_file_bases())
+        tools = _DreamToolRegistry(state)
 
-        tools.register(ReadFileTool(
+        tools.register(_DreamToolAdapter(self, state, ReadFileTool(
             workspace=workspace,
             allowed_dir=workspace,
             extra_read_allowed_dirs=extra_read,
             file_states=file_states,
-        ))
-        tools.register(EditFileTool(
+        )))
+        tools.register(_DreamToolAdapter(self, state, EditFileTool(
             workspace=workspace,
             allowed_dir=skills_dir,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
-        ))
-        tools.register(ApplyPatchTool(
+        )))
+        tools.register(_DreamToolAdapter(self, state, ApplyPatchTool(
             workspace=workspace,
             allowed_dir=skills_dir,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
-        ))
-        tools.register(WriteFileTool(
+        )))
+        tools.register(_DreamToolAdapter(self, state, WriteFileTool(
             workspace=workspace,
             allowed_dir=skills_dir,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
-        ))
+        )))
         return tools
+
+    @staticmethod
+    def dream_tools_completed(tools: ToolRegistry | None) -> bool:
+        return not isinstance(tools, _DreamToolRegistry) or tools.writes_resolved
 
     @staticmethod
     def dream_run_completed(
@@ -628,8 +889,11 @@ class MemoryStore:
     @staticmethod
     def dream_incompletion_reason(
         resp: object | None,
+        tools: ToolRegistry | None = None,
     ) -> str:
         """Human-readable explanation of why a Dream run cannot advance."""
+        if isinstance(tools, _DreamToolRegistry) and not tools.writes_resolved:
+            return "unresolved memory write: " + ", ".join(tools.unresolved_writes)
         metadata = getattr(resp, "metadata", None)
         if isinstance(metadata, dict):
             stop_reason = cast(dict[str, Any], metadata).get("_stop_reason", "unknown")
@@ -740,6 +1004,319 @@ class MemoryStore:
                     logger.warning("Failed to prune dream session {}", path)
 
 
+@dataclass(frozen=True, slots=True)
+class _DreamFileBase:
+    """Canonical file contents observed by one Dream tool session."""
+
+    content: str
+    exists: bool
+
+
+class _DreamWriteState:
+    """Track trusted bases and write conflicts that Dream has not resolved."""
+
+    def __init__(self, bases: dict[MemoryTarget, _DreamFileBase]) -> None:
+        self.bases = dict(bases)
+        self._unresolved: set[str] = set()
+
+    def refresh(self, bases: dict[MemoryTarget, _DreamFileBase]) -> None:
+        self.bases = dict(bases)
+
+    def mark_unresolved(self, *paths: str) -> None:
+        self._unresolved.update(paths)
+
+    def clear_unresolved(self, *paths: str) -> None:
+        self._unresolved.difference_update(paths)
+
+    @property
+    def writes_resolved(self) -> bool:
+        return not self._unresolved
+
+    @property
+    def unresolved_writes(self) -> tuple[str, ...]:
+        return tuple(sorted(self._unresolved))
+
+
+class _DreamToolRegistry(ToolRegistry):
+    """Ordinary registry with Dream write-conflict status attached."""
+
+    def __init__(self, state: _DreamWriteState) -> None:
+        super().__init__()
+        self._state = state
+
+    @property
+    def writes_resolved(self) -> bool:
+        return self._state.writes_resolved
+
+    @property
+    def unresolved_writes(self) -> tuple[str, ...]:
+        return self._state.unresolved_writes
+
+
+class _DreamToolAdapter(Tool):
+    """Route canonical Dream edits through the shared memory coordinator."""
+
+    def __init__(
+        self,
+        store: MemoryStore,
+        state: _DreamWriteState,
+        delegate: Tool,
+    ) -> None:
+        self._store = store
+        self._state = state
+        self._delegate = delegate
+
+    @property
+    def name(self) -> str:
+        return self._delegate.name
+
+    @property
+    def description(self) -> str:
+        return self._delegate.description
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return self._delegate.parameters
+
+    @property
+    def read_only(self) -> bool:
+        return self._delegate.read_only
+
+    @property
+    def exclusive(self) -> bool:
+        return self._delegate.exclusive
+
+    def runtime_context_provider(self):
+        return self._delegate.runtime_context_provider()
+
+    @staticmethod
+    def _is_error(result: object) -> bool:
+        return isinstance(result, ToolResult) and result.is_error
+
+    def _resolve_path(self, path: str, *, read: bool = False) -> Path:
+        method_name = "_resolve_read" if read else "_resolve_write"
+        resolver = cast(Callable[[str], Path], getattr(self._delegate, method_name))
+        return resolver(path)
+
+    def _target_key(self, target: MemoryTarget) -> str:
+        return self._store._canonical_relative_path(target)
+
+    def _path_key(self, path: Path, target: MemoryTarget | None) -> str:
+        return self._target_key(target) if target is not None else str(path)
+
+    def _refresh_bases(self) -> None:
+        self._state.refresh(self._store._dream_file_bases())
+
+    def _commit(
+        self,
+        targets: set[MemoryTarget],
+        proposed: dict[MemoryTarget, str],
+        keys: set[str],
+    ) -> ToolResult | None:
+        bases: dict[MemoryTarget, str] = {
+            target: self._state.bases[target].content for target in targets
+        }
+        committed, reason = self._store._commit_dream_files(bases, proposed)
+        if not committed:
+            self._state.mark_unresolved(*keys)
+            return ToolResult.error(
+                "Memory write conflict: "
+                f"{reason or 'dream_memory_commit_failed'}. "
+                "Re-read the affected canonical file and retry the edit once."
+            )
+        self._state.clear_unresolved(*keys)
+        self._refresh_bases()
+        return None
+
+    @staticmethod
+    def _materialize_base(
+        shadow: Path,
+        relative_path: str,
+        base: _DreamFileBase,
+    ) -> Path:
+        path = shadow / relative_path
+        if base.exists:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(path, base.content, newline="")
+        return path
+
+    async def _execute_read(self, **kwargs: Any) -> Any:
+        result = await self._delegate.execute(**kwargs)
+        raw_path = kwargs.get("path")
+        if self._is_error(result) or not isinstance(raw_path, str):
+            return result
+        try:
+            path = self._resolve_path(raw_path, read=True)
+            target = self._store._canonical_target_for_path(path)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return result
+        if target is not None:
+            latest = self._store._dream_file_bases()
+            self._state.bases[target] = latest[target]
+        return result
+
+    async def _execute_write(self, **kwargs: Any) -> Any:
+        raw_path = kwargs.get("path")
+        content = kwargs.get("content")
+        if not isinstance(raw_path, str) or not isinstance(content, str):
+            return await self._delegate.execute(**kwargs)
+        try:
+            path = self._resolve_path(raw_path)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return await self._delegate.execute(**kwargs)
+        target = self._store._canonical_target_for_path(path)
+        if target is None:
+            result = await self._delegate.execute(**kwargs)
+            if not self._is_error(result):
+                self._state.clear_unresolved(self._path_key(path, None))
+            return result
+        key = self._target_key(target)
+        error = self._commit({target}, {target: content}, {key})
+        if error is not None:
+            return error
+        return f"Successfully wrote {len(content)} characters to {key}"
+
+    async def _execute_edit(self, **kwargs: Any) -> Any:
+        from nanobot.agent.tools.file_state import FileStates
+        from nanobot.agent.tools.filesystem import EditFileTool
+
+        raw_path = kwargs.get("path")
+        if not isinstance(raw_path, str):
+            return await self._delegate.execute(**kwargs)
+        try:
+            path = self._resolve_path(raw_path)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return await self._delegate.execute(**kwargs)
+        target = self._store._canonical_target_for_path(path)
+        if target is None:
+            result = await self._delegate.execute(**kwargs)
+            if not self._is_error(result):
+                self._state.clear_unresolved(self._path_key(path, None))
+            return result
+
+        key = self._target_key(target)
+        with TemporaryDirectory(prefix="nanobot-dream-") as raw_shadow:
+            shadow = Path(raw_shadow)
+            shadow_path = self._materialize_base(
+                shadow,
+                key,
+                self._state.bases[target],
+            )
+            tool = EditFileTool(
+                workspace=shadow,
+                allowed_dir=shadow,
+                file_states=FileStates(),
+            )
+            shadow_kwargs = dict(kwargs)
+            shadow_kwargs["path"] = key
+            result = await tool.execute(**shadow_kwargs)
+            if self._is_error(result):
+                return result
+            proposed = shadow_path.read_text(encoding="utf-8") if shadow_path.exists() else ""
+
+        error = self._commit({target}, {target: proposed}, {key})
+        if error is not None:
+            return error
+        return f"Successfully edited {key} through the protected memory writer"
+
+    async def _execute_patch(self, **kwargs: Any) -> Any:
+        from nanobot.agent.tools.apply_patch import ApplyPatchTool
+        from nanobot.agent.tools.file_state import FileStates
+
+        edits_value = kwargs.get("edits")
+        if not isinstance(edits_value, list):
+            return await self._delegate.execute(**kwargs)
+        edits = cast(list[object], edits_value)
+        resolved: list[tuple[dict[str, Any], Path, MemoryTarget | None]] = []
+        try:
+            for value in edits:
+                if not isinstance(value, dict):
+                    return await self._delegate.execute(**kwargs)
+                edit = cast(dict[str, Any], value)
+                raw_path = edit.get("path")
+                if not isinstance(raw_path, str):
+                    return await self._delegate.execute(**kwargs)
+                path = self._resolve_path(raw_path)
+                resolved.append((edit, path, self._store._canonical_target_for_path(path)))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return await self._delegate.execute(**kwargs)
+
+        has_canonical = any(target is not None for _, _, target in resolved)
+        has_other = any(target is None for _, _, target in resolved)
+        keys = {
+            self._path_key(path, target)
+            for _, path, target in resolved
+        }
+        if has_canonical and has_other:
+            self._state.mark_unresolved(*keys)
+            return ToolResult.error(
+                "A patch cannot mix canonical memory files with Skill files. "
+                "Split it into separate apply_patch calls and retry."
+            )
+        if not has_canonical:
+            result = await self._delegate.execute(**kwargs)
+            if not self._is_error(result):
+                self._state.clear_unresolved(*keys)
+            return result
+
+        targets: set[MemoryTarget] = {
+            target
+            for _, _, target in resolved
+            if target is not None
+        }
+        with TemporaryDirectory(prefix="nanobot-dream-") as raw_shadow:
+            shadow = Path(raw_shadow)
+            shadow_paths: dict[MemoryTarget, Path] = {}
+            for target in targets:
+                relative_path = self._target_key(target)
+                shadow_paths[target] = self._materialize_base(
+                    shadow,
+                    relative_path,
+                    self._state.bases[target],
+                )
+            shadow_edits: list[dict[str, Any]] = []
+            for edit, _, target in resolved:
+                assert target is not None
+                shadow_edit = dict(edit)
+                shadow_edit["path"] = self._target_key(target)
+                shadow_edits.append(shadow_edit)
+            tool = ApplyPatchTool(
+                workspace=shadow,
+                allowed_dir=shadow,
+                file_states=FileStates(),
+            )
+            result = await tool.execute(
+                edits=cast(list[object], shadow_edits),
+                dry_run=bool(kwargs.get("dry_run", False)),
+            )
+            if self._is_error(result) or bool(kwargs.get("dry_run", False)):
+                return result
+            proposed: dict[MemoryTarget, str] = {
+                target: (
+                    shadow_paths[target].read_text(encoding="utf-8")
+                    if shadow_paths[target].exists()
+                    else ""
+                )
+                for target in targets
+            }
+
+        error = self._commit(targets, proposed, keys)
+        if error is not None:
+            return error
+        return str(result)
+
+    async def execute(self, **kwargs: Any) -> Any:
+        if self.name == "read_file":
+            return await self._execute_read(**kwargs)
+        if self.name == "write_file":
+            return await self._execute_write(**kwargs)
+        if self.name == "edit_file":
+            return await self._execute_edit(**kwargs)
+        if self.name == "apply_patch":
+            return await self._execute_patch(**kwargs)
+        return await self._delegate.execute(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Memory ingestion and context-pressure coordination
 # ---------------------------------------------------------------------------
@@ -831,12 +1408,15 @@ class MemoryArchiver:
         input_token_budget: int | None = None,
         fallback_max_tokens: int | None = None,
         provider_state: ProviderConversationState | None = None,
+        structured_context: bool = False,
     ) -> str | None:
         """Append the archive prompt to H and persist its summary."""
         if not source_messages:
             return None
 
-        def raw_fallback() -> str:
+        def raw_fallback() -> str | None:
+            if structured_context:
+                return None
             return self._raw_checkpoint(
                 source_messages,
                 session_key=session_key,
@@ -849,7 +1429,7 @@ class MemoryArchiver:
             )
 
         prompt = render_template(
-            "agent/consolidator_archive.md",
+            "agent/context_summary.md" if structured_context else "agent/consolidator_archive.md",
             strip=True,
             archive_count=len(source_messages),
         )
@@ -926,6 +1506,8 @@ class MemoryArchiver:
         if not summary or not summary.strip():
             logger.warning("Memory archive provider returned no summary, raw-dumping to history")
             return raw_fallback()
+        if structured_context:
+            return summary.strip()
         summary = self.store._normalize_history_entry(summary)
         if not summary:
             logger.warning("Memory archive provider summary was not safe to replay, raw-dumping")
@@ -1048,7 +1630,8 @@ class Consolidator:
         session_key: str,
         tools: list[dict[str, Any]],
         provider_state: ProviderConversationState | None = None,
-    ) -> str | None:
+        structured_context: bool = False,
+    ) -> ContextSummaryCandidate | str | None:
         """Summarize the exact transcript prefix already accepted by the model."""
         source_messages = [
             dict(message)
@@ -1075,17 +1658,21 @@ class Consolidator:
             input_token_budget=input_token_budget,
             fallback_max_tokens=max(1, checkpoint_tokens),
             provider_state=provider_state,
+            structured_context=structured_context,
         )
-        if summary == "(nothing)":
-            summary = self.archiver._raw_checkpoint(
-                source_messages,
-                session_key=session_key,
-                previous_summary=previous_summary,
-                max_tokens=max_output_tokens,
-            )
         if summary is None:
             return None
-        return truncate_text_to_tokens(summary, max(1, max_output_tokens))
+        if not structured_context:
+            return summary
+        try:
+            structured = StructuredContextSummary.model_validate_json(summary)
+        except ValueError:
+            logger.warning("Context summary provider returned invalid structured output")
+            return None
+        return ContextSummaryCandidate(
+            text=render_context_summary(structured),
+            structured=structured,
+        )
 
     async def summarize_provider_compaction(
         self,
@@ -1096,7 +1683,8 @@ class Consolidator:
         runtime: LLMRuntime,
         session_key: str,
         tools: list[dict[str, Any]],
-    ) -> str | None:
+        structured_context: bool = False,
+    ) -> ContextSummaryCandidate | str | None:
         """Prompt a native compacted state without replaying its raw history."""
         return await self.summarize_transcript(
             fallback_messages,
@@ -1105,6 +1693,7 @@ class Consolidator:
             session_key=session_key,
             tools=tools,
             provider_state=state,
+            structured_context=structured_context,
         )
 
     @staticmethod

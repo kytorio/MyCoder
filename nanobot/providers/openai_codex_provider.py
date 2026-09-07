@@ -247,6 +247,8 @@ class OpenAICodexProvider(LLMProvider):
             if native_compaction_state is not None:
                 result.provider_compaction_state = native_compaction_state
                 result.provider_compaction_scope = "prior_context"
+            if {"messages", "input", "instructions", "system", "prompt"}.intersection(self._extra_body):
+                result.context_acceptance = "unknown"
             return result
         except Exception as e:
             response = _codex_error_response(e)
@@ -527,6 +529,8 @@ async def _request_codex(
                 usage=usage,
                 reasoning_content=reasoning_content,
             )
+            if capture.completed and finish_reason in {"stop", "length", "tool_calls"}:
+                result.context_acceptance = "accepted"
             if capture.completed and is_replayable_finish_reason(finish_reason):
                 result.provider_state = build_responses_state(
                     provider=f"openai_codex:{url.rstrip('/')}",

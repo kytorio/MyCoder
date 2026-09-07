@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TypedDict, cast
+from typing import Any, NotRequired, TypedDict, cast
 
 SUMMARY_CONTINUATION_TEXT = (
     "Continue the active task from the working-memory checkpoint above."
@@ -14,6 +14,7 @@ SUMMARY_CONTINUATION_TEXT = (
 class SessionSummary(TypedDict):
     text: str
     last_active: str
+    structured: NotRequired[dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +23,7 @@ class SessionSummaryCheckpoint:
 
     summary: str
     transcript_boundary: int
+    structured: dict[str, Any] | None = None
 
 
 def session_summary_from_metadata(
@@ -45,4 +47,19 @@ def session_summary_from_metadata(
             last_active = fallback_last_active.isoformat()
     else:
         last_active = fallback_last_active.isoformat()
-    return {"text": text, "last_active": last_active}
+    result: SessionSummary = {"text": text, "last_active": last_active}
+    structured = summary_data.get("structured")
+    if isinstance(structured, Mapping):
+        from pydantic import ValidationError
+
+        from nanobot.agent.context_plan import StructuredContextSummary
+
+        try:
+            validated = StructuredContextSummary.model_validate(
+                dict(cast(Mapping[str, object], structured))
+            )
+        except ValidationError:
+            pass
+        else:
+            result["structured"] = validated.model_dump(mode="json")
+    return result

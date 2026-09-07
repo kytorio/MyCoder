@@ -643,6 +643,8 @@ def parse_response_output(
         finish_reason=finish_reason,
         usage=usage,
         reasoning_content=reasoning_content if isinstance(reasoning_content, str) else None,
+        context_acceptance="accepted" if status in {"completed", "incomplete"} and finish_reason in {
+            "stop", "length", "tool_calls", "function_call"} else "unknown",
     )
     if (
         state_provider is not None

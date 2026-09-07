@@ -16,7 +16,9 @@ from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from loguru import logger
+from pydantic import ValidationError
 
+from nanobot.agent.context_plan import StructuredContextSummary, render_context_summary
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.outbound_events import (
     RecoveryStateEvent,
@@ -25,8 +27,10 @@ from nanobot.bus.outbound_events import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.session import turn_continuation
+from nanobot.session.history_visibility import HIDDEN_HISTORY_META
 from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT, SessionSummaryCheckpoint
 from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
 from nanobot.webui.session_identity import webui_chat_id, webui_session_key
 
@@ -38,6 +42,9 @@ PENDING_FOLLOWUPS_KEY = "pending_user_followups"
 PENDING_FOLLOWUP_ID_KEY = "_recovery_followup_id"
 PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
 PROVIDER_STATE_CHECKPOINT_VERSION = "v1"
+SUMMARY_CHECKPOINT_KEY = "summary_checkpoint"
+SUMMARY_CHECKPOINT_DELTA_KEY = "summary_checkpoint_delta"
+SUMMARY_CHECKPOINT_VERSION = 1
 
 _RECOVERY_STATUSES = frozenset({"resuming", "awaiting_user", "recovered", "failed"})
 _UNCERTAIN_TOOL_PHASES = frozenset({"awaiting_tools"})
@@ -273,6 +280,88 @@ def _runtime_checkpoint_is_well_formed(checkpoint: Mapping[str, Any]) -> bool:
     return False
 
 
+def _validated_staged_summary(
+    checkpoint: Mapping[str, Any],
+    session: Session,
+) -> tuple[SessionSummaryCheckpoint, int] | None:
+    """Decode a committed L4 stage without trusting unknown summary shapes."""
+    raw = cast(object, checkpoint.get(SUMMARY_CHECKPOINT_KEY))
+    if not isinstance(raw, dict):
+        return None
+    data = cast(dict[str, Any], raw)
+    text = data.get("text")
+    structured_value = cast(object, data.get("structured"))
+    boundary = data.get("transcript_boundary")
+    insert_at = data.get("session_insert_at")
+    if (
+        data.get("version") != SUMMARY_CHECKPOINT_VERSION
+        or not isinstance(text, str)
+        or not text.strip()
+        or not isinstance(structured_value, dict)
+        or isinstance(boundary, bool)
+        or not isinstance(boundary, int)
+        or boundary < 1
+        or isinstance(insert_at, bool)
+        or not isinstance(insert_at, int)
+        or not 0 <= insert_at <= len(session.messages)
+    ):
+        return None
+    try:
+        structured = StructuredContextSummary.model_validate(structured_value)
+    except ValidationError:
+        return None
+    if render_context_summary(structured) != text:
+        return None
+    has_runtime_rows = any(
+        key in checkpoint
+        for key in (
+            "phase",
+            "assistant_message",
+            "completed_tool_results",
+            "pending_tool_calls",
+        )
+    )
+    if has_runtime_rows and not _runtime_checkpoint_is_well_formed(checkpoint):
+        return None
+    return (
+        SessionSummaryCheckpoint(
+            summary=text,
+            transcript_boundary=boundary,
+            structured=structured.model_dump(mode="json"),
+        ),
+        insert_at,
+    )
+
+
+def _materialize_staged_summary(
+    session: Session,
+    checkpoint: SessionSummaryCheckpoint,
+    insert_at: int,
+) -> None:
+    """Install one hidden continuation marker and the trusted readable summary."""
+    already_present = (
+        insert_at < len(session.messages)
+        and session.messages[insert_at].get("content") == SUMMARY_CONTINUATION_TEXT
+        and session.messages[insert_at].get(HIDDEN_HISTORY_META) is True
+    )
+    if not already_present:
+        session.messages.insert(
+            insert_at,
+            {
+                "role": "user",
+                "content": SUMMARY_CONTINUATION_TEXT,
+                HIDDEN_HISTORY_META: True,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+    session.metadata["_last_summary"] = {
+        "text": checkpoint.summary,
+        "last_active": session.updated_at.isoformat(),
+        "structured": checkpoint.structured,
+    }
+    session.last_archived = insert_at
+
+
 def restore_runtime_checkpoint(session: Session) -> bool:
     """Materialize the durable checkpoint exactly once and clear it.
 
@@ -284,11 +373,20 @@ def restore_runtime_checkpoint(session: Session) -> bool:
     if not isinstance(checkpoint, dict):
         return False
     data = cast(dict[str, Any], checkpoint)
+    staged_summary = _validated_staged_summary(data, session)
+    summary_materialized = staged_summary is not None
+    if staged_summary is not None:
+        summary_checkpoint, insert_at = staged_summary
+        _materialize_staged_summary(session, summary_checkpoint, insert_at)
     assistant = cast(object, data.get("assistant_message"))
     completed_value = cast(object, data.get("completed_tool_results"))
     pending_value = cast(object, data.get("pending_tool_calls"))
     completed = cast(list[object], completed_value) if isinstance(completed_value, list) else []
     pending = cast(list[object], pending_value) if isinstance(pending_value, list) else []
+    if summary_materialized and data.get(SUMMARY_CHECKPOINT_DELTA_KEY) is not True:
+        assistant = None
+        completed = []
+        pending = []
 
     restored: list[dict[str, Any]] = []
     if isinstance(assistant, dict):
@@ -362,7 +460,7 @@ def restore_runtime_checkpoint(session: Session) -> bool:
         and assistant_data.get("role") == "assistant"
         and not data.get("pending_tool_calls")
     )
-    if not (synchronized and (exact_final or exact_tools)):
+    if summary_materialized or not (synchronized and (exact_final or exact_tools)):
         session.provider_state = None
 
     session.metadata.pop(PENDING_USER_TURN_KEY, None)
@@ -491,7 +589,11 @@ class RecoveryCoordinator:
             if route is None:
                 continue
             unfinished = self._has_unfinished_webui_transcript(key)
-            if not self._needs_recovery(metadata) and not unfinished:
+            if (
+                not self._needs_recovery(metadata)
+                and not unfinished
+                and not self.sessions.has_runtime_checkpoint(key)
+            ):
                 continue
             session = self.sessions.get_or_create(key)
             try:
@@ -714,7 +816,16 @@ class RecoveryCoordinator:
         recovery_id = uuid4().hex
         phase = checkpoint.get("phase") if checkpoint is not None else None
         pending_calls = checkpoint.get("pending_tool_calls") if checkpoint is not None else None
-        if checkpoint is not None and phase not in _KNOWN_CHECKPOINT_PHASES:
+        summary_only = (
+            checkpoint is not None
+            and phase is None
+            and _validated_staged_summary(checkpoint, session) is not None
+        )
+        if (
+            checkpoint is not None
+            and phase not in _KNOWN_CHECKPOINT_PHASES
+            and not summary_only
+        ):
             _discard_runtime_checkpoint(session)
             restore_pending_interruption(session)
             waiting = self._set_state(
@@ -728,7 +839,11 @@ class RecoveryCoordinator:
             self.sessions.save(session)
             await self._publish(chat_id, waiting)
             return
-        if checkpoint is not None and not _runtime_checkpoint_is_well_formed(checkpoint):
+        if (
+            checkpoint is not None
+            and not summary_only
+            and not _runtime_checkpoint_is_well_formed(checkpoint)
+        ):
             _discard_runtime_checkpoint(session)
             restore_pending_interruption(session)
             waiting = self._set_state(

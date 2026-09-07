@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "cases": [{
+    "schema_version": 1,
+    "id": "basic-pong",
+    "description": "Offline real-runtime smoke, not a semantic quality benchmark",
+    "user_inputs": ["Reply pong"],
+    "scripted_responses": [{"content": "pong", "finish_reason": "stop"}],
+    "allowed_tools": [],
+    "verifiers": [{"name": "answer_contains", "expected": "pong"}],
+    "tags": ["smoke", "mechanism-only"]
+  }]
+}

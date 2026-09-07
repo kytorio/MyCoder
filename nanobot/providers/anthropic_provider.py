@@ -717,6 +717,9 @@ class AnthropicProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            context_acceptance="accepted" if response.stop_reason in {
+                "end_turn", "max_tokens", "tool_use"
+            } else "unknown",
             thinking_blocks=thinking_blocks or None,
         )
 
@@ -796,6 +799,7 @@ class AnthropicProvider(LLMProvider):
                 # The SDK accumulates the final message snapshot during
                 # iteration, so get_final_message() below returns instantly.
                 tool_blocks: dict[int, dict[str, str]] = {}
+                terminal_seen = False
                 while True:
                     try:
                         chunk = await asyncio.wait_for(
@@ -804,7 +808,9 @@ class AnthropicProvider(LLMProvider):
                         )
                     except StopAsyncIteration:
                         break
-                    if chunk.type == "content_block_start":
+                    if chunk.type == "message_stop":
+                        terminal_seen = True
+                    elif chunk.type == "content_block_start":
                         block = getattr(chunk, "content_block", None)
                         if getattr(block, "type", None) == "tool_use":
                             index = int(getattr(chunk, "index", 0) or 0)
@@ -848,7 +854,10 @@ class AnthropicProvider(LLMProvider):
                                 "arguments_delta": partial,
                             })
                 response = await stream.get_final_message()
-            return self._parse_response(response)
+            result = self._parse_response(response)
+            if not terminal_seen:
+                result.context_acceptance = "unknown"
+            return result
         except asyncio.TimeoutError:
             return LLMResponse(
                 content=(

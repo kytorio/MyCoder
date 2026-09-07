@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -22,6 +22,7 @@ from loguru import logger
 from nanobot.utils.helpers import sanitize_surrogates_deep
 
 if TYPE_CHECKING:
+    from nanobot.agent.context_plan import ContextRequestOutcome
     from nanobot.llm_usage.models import LLMCallRecord
 
 STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
@@ -260,6 +261,8 @@ class ProviderCallContext:
     conversation_state: ProviderConversationState | None = field(default=None, repr=False)
     context_window_tokens: int | None = None
     session_id: str | None = field(default=None, repr=False)
+    context_request: ContextRequestOutcome | None = field(default=None, repr=False)
+    context_payload_hash: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -590,6 +593,9 @@ class LLMResponse:
     error_code: str | None = None  # Provider/code semantic, e.g. rate_limit_exceeded.
     error_retry_after_s: float | None = None
     error_should_retry: bool | None = None
+    # Adapter-local protocol evidence; only the base binds a request receipt.
+    context_acceptance: Literal["accepted", "rejected", "unknown"] = "unknown"
+    context_outcome: ContextRequestOutcome | None = field(default=None, repr=False)
 
     @property
     def has_tool_calls(self) -> bool:
@@ -1256,12 +1262,47 @@ class LLMProvider(ABC):
                         found = True
         return found
 
+    @staticmethod
+    def _context_payload_hash(kwargs: dict[str, Any]) -> str:
+        from nanobot.agent.context_plan import content_hash
+
+        return content_hash({"messages": kwargs.get("messages"), "tools": kwargs.get("tools")})
+
+    @staticmethod
+    def _bind_context_outcome(
+        response: LLMResponse, context: ProviderCallContext | None,
+        dispatched_hash: str, returned_hash: str,
+    ) -> LLMResponse:
+        """Bind adapter evidence to the exact logical payload supplied to this call."""
+        if context is None or context.context_request is None:
+            return response
+        request = context.context_request
+        status = response.context_acceptance
+        if (not context.context_payload_hash
+                or context.context_payload_hash != dispatched_hash
+                or dispatched_hash != returned_hash):
+            status = "unknown"
+        elif response.context_outcome is not None:
+            # A child may have retried a different payload. Never upgrade its receipt.
+            child = response.context_outcome
+            status = child.status if replace(child, status="unknown") == request else "unknown"
+        elif context.conversation_state is not None and status == "accepted":
+            # Opaque replay may replace logical messages with a compacted state.
+            # A terminal attests that wire input, not unseen logical full text.
+            status = "unknown"
+        if response.finish_reason in {"error", "cancelled"}:
+            status = "rejected" if (response.context_acceptance == "rejected"
+                                     or response.error_status_code in {400, 401, 403, 404, 413, 422, 429}) else "unknown"
+        return replace(response, context_outcome=replace(request, status=status))
+
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         """Call chat() and convert unexpected exceptions to error responses."""
         started_at_ms = time.time_ns() // 1_000_000
         started_at_ns = time.monotonic_ns()
+        provider_context = kwargs.pop("provider_context", None)
+        bind_context = isinstance(provider_context, ProviderCallContext) and provider_context.context_request is not None
+        dispatched_hash = self._context_payload_hash(kwargs) if bind_context else ""
         try:
-            provider_context = kwargs.pop("provider_context", None)
             if isinstance(provider_context, ProviderCallContext):
                 response = await self.chat_with_context(
                     provider_context=provider_context,
@@ -1284,6 +1325,9 @@ class LLMProvider(ABC):
             raise
         except Exception as exc:
             response = self._error_response_from_exception(exc)
+        if bind_context:
+            response = self._bind_context_outcome(response, provider_context, dispatched_hash,
+                                                  self._context_payload_hash(kwargs))
         return self._observe_llm_call(
             response,
             kwargs,
@@ -1402,8 +1446,10 @@ class LLMProvider(ABC):
                 )
             return response
 
+        provider_context = kwargs.pop("provider_context", None)
+        bind_context = isinstance(provider_context, ProviderCallContext) and provider_context.context_request is not None
+        dispatched_hash = self._context_payload_hash(kwargs) if bind_context else ""
         try:
-            provider_context = kwargs.pop("provider_context", None)
             if isinstance(provider_context, ProviderCallContext):
                 response = await self.chat_stream_with_context(
                     provider_context=provider_context,
@@ -1426,6 +1472,9 @@ class LLMProvider(ABC):
             raise
         except Exception as exc:
             response = self._error_response_from_exception(exc)
+        if bind_context:
+            response = self._bind_context_outcome(response, provider_context, dispatched_hash,
+                                                  self._context_payload_hash(kwargs))
         return self._observe_llm_call(
             _attach_stream_timing(response),
             kwargs,
@@ -1732,12 +1781,8 @@ class LLMProvider(ABC):
                     ):
                         # Provider-owned payloads may retain earlier input_image items.
                         # Rebuild from the stripped public transcript for this retry.
-                        stripped_context = ProviderCallContext(
-                            context_window_tokens=(
-                                provider_context.context_window_tokens
-                            ),
-                            session_id=provider_context.session_id,
-                        )
+                        stripped_context = replace(
+                            provider_context, conversation_state=None, context_payload_hash=None)
                 if stripped is not None or stripped_context is not None:
                     logger.warning(
                         "Non-transient LLM error with image content, retrying without images"

@@ -7,9 +7,9 @@ description: Search conversation history and understand Dream-managed profile an
 
 ## Structure
 
-- `SOUL.md` — Bot personality and communication style. **Managed by Dream.** Do NOT edit.
-- `USER.md` — User profile and preferences. **Managed by Dream.** Do NOT edit.
-- `memory/MEMORY.md` — Long-term facts (project context, important events). **Managed by Dream.** Do NOT edit.
+- `SOUL.md` — Bot personality and communication style. Managed through `memory_save` and Dream. Do not edit directly.
+- `USER.md` — User profile and preferences. Managed through `memory_save` and Dream. Do not edit directly.
+- `memory/MEMORY.md` — Long-term facts (project context, important events). Managed through `memory_save` and Dream. Do not edit directly.
 - `memory/history.jsonl` — append-only JSONL, not loaded into context. Prefer the
   built-in `grep` tool to search it.
 
@@ -33,6 +33,13 @@ Examples (replace `<history-log-path>` with the path from the system prompt):
 
 ## Important
 
-- **Do NOT edit SOUL.md, USER.md, or MEMORY.md.** They are automatically managed by Dream.
-- If you notice outdated information, it will be corrected when Dream runs next.
+- Use `memory_save` only for a durable fact or preference explicitly supported by the current
+  user's own request. Pass an exact `source_excerpt`; never save secrets, temporary instructions,
+  quoted third-party claims, or inferred facts.
+- Only tell the user that a fact was remembered after `memory_save` returns `status=committed`.
+  If the tool is unavailable or returns an error, say that it was not confirmed saved.
+- **Do not directly edit SOUL.md, USER.md, or MEMORY.md.** Explicit entries are protected from
+  ordinary file writes and Dream rewrites.
+- To correct an explicit entry, call `memory_save` with the user's new explicit statement and the
+  prior `entry_id` as `replaces_entry_id`.
 - Users can view Dream's activity with the `/dream-log` command.

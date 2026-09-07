@@ -21,6 +21,7 @@ from nanobot.utils.workspace_prompts import initialize_workspace_prompt
 
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.memory_writes import MemoryCommitResult
     from nanobot.session.manager import Session
     from nanobot.utils.gitstore import CommitInfo
 
@@ -438,6 +439,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
         content = ""
         resp = None
         diff_body = ""
+        dream_tools = None
         t0 = time.monotonic()
         try:
             result = store.build_dream_prompt()
@@ -451,11 +453,12 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             prompt, last_cursor = result
             key = dream_session_key()
             dream_runtime = loop.dream_runtime()
+            dream_tools = store.build_dream_tools()
             resp = await loop.process_direct(
                 prompt,
                 session_key=key,
                 ephemeral=True,
-                tools=store.build_dream_tools(),
+                tools=dream_tools,
                 on_progress=_silent,
                 runtime=dream_runtime,
             )
@@ -463,7 +466,10 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             # The real file delta grounds the audit record; normal completion
             # decides whether this history batch has finished processing.
             diff_body = store.dream_content_diff()
-            completed = MemoryStore.dream_run_completed(resp)
+            completed = (
+                MemoryStore.dream_run_completed(resp)
+                and MemoryStore.dream_tools_completed(dream_tools)
+            )
             if completed:
                 store.set_last_dream_cursor(last_cursor)
                 if diff_body:
@@ -471,7 +477,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 else:
                     content = f"Dream completed in {elapsed:.1f}s; no memory changes."
             else:
-                reason = MemoryStore.dream_incompletion_reason(resp)
+                reason = MemoryStore.dream_incompletion_reason(resp, dream_tools)
                 content = (
                     f"Dream did not complete after {elapsed:.1f}s ({reason}); "
                     "memory cursor was not advanced."
@@ -481,10 +487,16 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         finally:
             if store.git.is_initialized():
-                commit_msg = build_dream_commit_message("dream: manual run", diff_body)
-                sha = store.git.auto_commit(commit_msg)
-                if sha:
-                    content += f" (commit {sha})"
+                try:
+                    commit_msg = build_dream_commit_message("dream: manual run", diff_body)
+                    sha = store.git.auto_commit(commit_msg)
+                    if sha:
+                        content += f" (commit {sha})"
+                except Exception:
+                    content += (
+                        " Memory changes were saved, but the Git audit commit failed; "
+                        "the memory cursor status above is unchanged."
+                    )
             store.compact_history()
             prune_dream_sessions(loop.sessions)
         await loop.bus.publish_outbound(OutboundMessage(
@@ -785,19 +797,59 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
             )
         else:
             changed_files = _format_changed_files(result[1])
-            new_sha = git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX)
-            if new_sha:
-                content = (
-                    f"Restored Dream memory to the state before `{sha}`.\n\n"
-                    f"- New safety commit: `{new_sha}`\n"
-                    f"- Restored files: {changed_files}\n\n"
-                    f"Use `/dream-log {new_sha}` to inspect the restore diff."
-                )
+            restore = getattr(store, "restore_dream_version", None)
+            if not callable(restore):
+                new_sha = git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX)
+                if new_sha:
+                    content = (
+                        f"Restored Dream memory to the state before `{sha}`.\n\n"
+                        f"- New safety commit: `{new_sha}`\n"
+                        f"- Restored files: {changed_files}\n\n"
+                        f"Use `/dream-log {new_sha}` to inspect the restore diff."
+                    )
+                else:
+                    content = (
+                        f"Couldn't restore Dream change `{sha}`.\n\n"
+                        "It may be the first saved version with no earlier state to restore."
+                    )
             else:
-                content = (
-                    f"Couldn't restore Dream change `{sha}`.\n\n"
-                    "It may be the first saved version with no earlier state to restore."
-                )
+                restore_result = cast("MemoryCommitResult | None", restore(sha))
+                if restore_result is None:
+                    content = (
+                        f"Couldn't restore Dream change `{sha}`.\n\n"
+                        "It may be the first saved version with no earlier state to restore."
+                    )
+                elif restore_result.status != "committed":
+                    reason = restore_result.reason_code or "memory_restore_conflict"
+                    content = (
+                        f"Couldn't restore Dream change `{sha}` because protected "
+                        f"memory validation failed (`{reason}`).\n\n"
+                        "No memory files or Git history were changed."
+                    )
+                else:
+                    try:
+                        new_sha = git.auto_commit(f"revert: undo {sha}")
+                    except Exception:
+                        new_sha = None
+                        audit_warning = (
+                            "\n\nThe memory restore succeeded, but the Git audit commit failed."
+                        )
+                    else:
+                        audit_warning = ""
+                    commit_line = (
+                        f"- New safety commit: `{new_sha}`\n" if new_sha else ""
+                    )
+                    inspect_line = (
+                        f"\nUse `/dream-log {new_sha}` to inspect the restore diff."
+                        if new_sha
+                        else ""
+                    )
+                    content = (
+                        f"Restored Dream memory to the state before `{sha}`.\n\n"
+                        f"{commit_line}"
+                        f"- Restored files: {changed_files}"
+                        f"{inspect_line}{audit_warning}"
+                    )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content=content, metadata={"render_as": "text"},

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "generator": "context_pressure",
+  "parameters": {
+    "history_counts": [4, 12, 24],
+    "memory_counts": [2, 10],
+    "request_styles": ["short", "long"],
+    "seed": 7
+  }
+}

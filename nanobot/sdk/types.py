@@ -100,6 +100,14 @@ class SessionSnapshot:
 
 
 @dataclass(slots=True)
+class SessionCompactionResult(SessionSnapshot):
+    """Session snapshot plus the typed outcome of an explicit L4 request."""
+
+    applied: bool = False
+    reason: str = "no_accepted_history"
+
+
+@dataclass(slots=True)
 class SessionInfo:
     """Compact session metadata for listings."""
 

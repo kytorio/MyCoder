@@ -51,6 +51,29 @@ def _retryable_error(content: str = "") -> LLMResponse:
     return _make_response(content, finish_reason="error", error_status_code=503)
 
 
+@pytest.mark.parametrize("proof", ["accepted", "unknown"])
+async def test_n07_runner_fallback_uses_only_final_child_receipt(tmp_path, proof):
+    from nanobot.agent.runner import AgentRunner
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.config.schema import ContextConfig
+    from tests.agent.runner_helpers import make_run_spec
+    from tests.agent.test_context_acceptance import EvidenceProvider, compaction_for
+
+    primary = EvidenceProvider([TimeoutError("primary timeout")])
+    primary._CHAT_RETRY_DELAYS = []
+    secondary = EvidenceProvider([LLMResponse(content="fallback done", context_acceptance=proof)])
+    provider = FallbackProvider(primary=primary, fallback_presets=[_fallback("offline")],
+                                provider_factory=lambda preset: secondary)
+    _, compaction = compaction_for()
+    result = await AgentRunner().run(make_run_spec(provider, model="offline", initial_messages=None,
+        transcript_input=compaction.transcript_input, transcript_builder=compaction.transcript_builder,
+        consolidate_history=compaction.consolidate_history, tools=ToolRegistry(),
+        context_config=ContextConfig(mode="enforce"), runtime_data_dir=tmp_path,
+        max_iterations=1, max_tool_result_chars=1000))
+    assert result.final_content == "fallback done"
+    assert (result.context_consumption is not None) is (proof == "accepted")
+
+
 def _fallback(
     model: str,
     provider: str = "custom",

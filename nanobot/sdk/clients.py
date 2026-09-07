@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from nanobot.bus.runtime_events import SessionTurnPersisted
 from nanobot.runtime_context import RUNTIME_CONTEXT_HISTORY_META, RuntimeContextProvider
 from nanobot.sdk.types import (
+    SessionCompactionResult,
     SessionInfo,
     SessionSnapshot,
     snapshot_from_payload,
@@ -208,15 +209,15 @@ class RuntimeClient:
         """Register a persisted-turn callback and return an unsubscribe callback."""
         return self._loop.runtime_events.subscribe(handler, SessionTurnPersisted)
 
-    async def compact_session(self, session_key: str) -> SessionSnapshot:
-        """Archive one session through the shared idle-compaction path."""
-        session = self._loop.sessions.get_or_create(session_key)
-        runtime = self._loop.runtime_for_session(session)
-        await self._loop.consolidator.compact_idle_session(
-            session_key,
-            runtime=runtime,
+    async def compact_session(self, session_key: str) -> SessionCompactionResult:
+        """Request Governor L4 and report an explicit applied/no-op reason."""
+        outcome = await self._loop.compact_session_context(session_key)
+        snapshot = snapshot_from_session(self._loop.sessions.get_or_create(session_key))
+        return SessionCompactionResult(
+            **snapshot.to_dict(),
+            applied=outcome.applied,
+            reason=outcome.reason,
         )
-        return snapshot_from_session(self._loop.sessions.get_or_create(session_key))
 
     async def compact_idle_session(self, session_key: str, *, max_suffix: int = 8) -> str | None:
         """Run idle-session compaction for one session and return the summary."""

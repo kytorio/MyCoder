@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "generator": "memory_dependency",
+  "parameters": {"seed": 7, "instances_per_category": 4}
+}

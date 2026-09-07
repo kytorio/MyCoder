@@ -1,13 +1,25 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import json
 import mimetypes
 import platform
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
+from nanobot.agent.context_plan import (
+    ContextPlan,
+    ContextSource,
+    RenderCatalog,
+    RenderedContext,
+    SourceCatalog,
+    message_sources,
+    source_for,
+)
+from nanobot.agent.context_sources import ContextSourcePolicy
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory_writes import MemoryWriteCoordinator
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import image_generation as image_generation_tools
 from nanobot.agent.tools import mcp as mcp_tools
@@ -96,10 +108,17 @@ class ContextBuilder:
     _RUNTIME_CONTEXT_TAG = RUNTIME_CONTEXT_TAG
     _RUNTIME_CONTEXT_END = RUNTIME_CONTEXT_END
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        *,
+        memory_writer: MemoryWriteCoordinator | None = None,
+    ):
         self.workspace = workspace
         self.timezone = timezone
-        self.memory = MemoryStore(workspace)
+        self.memory = MemoryStore(workspace, writer=memory_writer)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -111,49 +130,111 @@ class ContextBuilder:
         include_memory: bool = True,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        return "".join(text for _, _, text in self._system_sections(
+            channel=channel, session_summary=session_summary, workspace=workspace,
+            include_memory=include_memory))
+
+    def _system_sections(
+        self, *, channel: str | None = None, session_summary: SessionSummary | None = None,
+        workspace: Path | None = None, include_memory: bool = True,
+    ) -> list[tuple[str, str, str]]:
+        """Collect source boundaries before joining any whole system prompt."""
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel, workspace=root)]
+        parts = [("system:identity", "system_policy", self._get_identity(channel=channel, workspace=root))]
 
-        bootstrap = self._load_bootstrap_files(root)
-        if bootstrap:
-            parts.append(bootstrap)
+        for index, (filename, text) in enumerate(self._bootstrap_sections(root)):
+            if not include_memory and filename != "AGENTS.md":
+                continue
+            prefix = "\n\n---\n\n" if index == 0 else "\n\n"
+            kind = "system_policy" if filename == "AGENTS.md" else "memory"
+            parts.append((f"{kind}:{filename}", kind, prefix + text))
 
-        parts.append(render_template("agent/tool_contract.md"))
+        def append(key: str, kind: str, text: str) -> None:
+            parts.append((key, kind, "\n\n---\n\n" + text))
+
+        append("system:tool_contract", "system_policy", render_template("agent/tool_contract.md"))
 
         project_path = root.expanduser().resolve()
         if project_path != self.workspace.expanduser().resolve():
-            parts.append(
+            append("runtime:project", "runtime",
                 "# Current Project\n\n"
                 f"Working directory: {project_path}\n"
                 "Use it as the default root for project files and relative tool paths."
             )
 
         if include_memory:
-            memory = self.memory.read_memory()
+            memory = self.memory.read_memory(project=root)
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
-                parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
+                append("memory:MEMORY.md", "memory", f"# Memory\n\n## Long-term Memory\n{memory}")
 
         active_skills = self.skills.get_always_skills()
         if active_skills:
             active_content = self.skills.load_skills_for_context(active_skills)
             if active_content:
-                parts.append(f"# Active Skills\n\n{active_content}")
+                append("skills:active", "skill_full", f"# Active Skills\n\n{active_content}")
 
         skills_summary = self.skills.build_skills_summary(
             exclude=set(active_skills),
             workspace=root,
         )
         if skills_summary:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+            append("skills:index", "skill_index", render_template("agent/skills_section.md", skills_summary=skills_summary))
 
         if session_summary:
-            parts.append(
+            append("summary:session", "summary",
                 "[Archived Context Summary]\n\n"
                 f"Previous conversation summary (last active {session_summary['last_active']}):\n"
                 f"{session_summary['text']}"
             )
 
-        return "\n\n---\n\n".join(parts)
+        return parts
+
+    def collect_sources(
+        self, transcript: TranscriptInput, *, channel: str | None = None,
+        workspace: Path | None = None, include_memory: bool = True,
+        tool_definitions: list[dict[str, Any]] | None = None,
+    ) -> list[ContextSource]:
+        sections = self._system_sections(
+            channel=channel, workspace=workspace, include_memory=include_memory,
+            session_summary=transcript.session_summary)
+        sources: list[ContextSource] = []
+        for key, kind, text in sections:
+            policy = ContextSourcePolicy.for_source(kind)
+            sources.append(source_for(key, kind, text, required=policy.required))
+        messages = [(f"history:{i}", json.dumps(message, ensure_ascii=False))
+                    for i, message in enumerate(transcript.history)]
+        current_blocks: Sequence[RuntimeContextBlock] | None = None
+        if transcript.current_message is not None:
+            current, current_blocks = self._current_message_parts(
+                transcript.current_message, media=list(transcript.media) if transcript.media else None,
+                current_role=transcript.current_role,
+                runtime_context_blocks=transcript.runtime_context_blocks)
+            messages.append(("current:0", json.dumps(current, ensure_ascii=False)))
+        for key, payload in messages:
+            sources.extend(message_sources(key, json.loads(payload), current=key == "current:0",
+                                           runtime_blocks=current_blocks if key == "current:0" else None))
+        from nanobot.utils.helpers import estimate_prompt_tokens
+
+        sources.append(source_for("schema:tools", "mcp_schema", tool_definitions or [],
+                                  required=True, tokens=estimate_prompt_tokens([], tool_definitions)))
+        sources.append(source_for("envelope", "envelope", len(messages) + 1,
+                                  required=True, tokens=4 * (len(messages) + 1)))
+        return SourceCatalog(sources, RenderCatalog(
+            system_parts=tuple((key, text) for key, _, text in sections),
+            messages=tuple(messages), tool_definitions=json.dumps(tool_definitions or [], ensure_ascii=False)))
+
+    @staticmethod
+    def render_plan(plan: ContextPlan) -> RenderedContext:
+        catalog = plan.render_catalog()
+        if catalog is None:
+            raise ValueError("render_plan requires a collected source catalog")
+        # N05 only renders intact selections. Partial/group transformations belong to N06+.
+        if any(decision.action != "keep" for decision in plan.decisions):
+            raise ValueError("partial source rendering is not implemented")
+        return RenderedContext(
+            messages=[{"role": "system", "content": "".join(text for _, text in catalog.system_parts)},
+                      *(json.loads(payload) for _, payload in catalog.messages)],
+            tool_definitions=json.loads(catalog.tool_definitions))
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""
@@ -197,7 +278,10 @@ class ContextBuilder:
 
     def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
         """Load project instructions plus the agent's global profile files."""
-        parts: list[str] = []
+        return "\n\n".join(text for _, text in self._bootstrap_sections(workspace))
+
+    def _bootstrap_sections(self, workspace: Path | None = None) -> list[tuple[str, str]]:
+        parts: list[tuple[str, str]] = []
         project_root = workspace or self.workspace
         sources = [
             ("AGENTS.md", project_root),
@@ -220,9 +304,9 @@ class ContextBuilder:
                     content, filename
                 ):
                     continue
-                parts.append(f"## {filename}\n\n{content}")
+                parts.append((filename, f"## {filename}\n\n{content}"))
 
-        return "\n\n".join(parts) if parts else ""
+        return parts
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
@@ -320,6 +404,16 @@ class ContextBuilder:
         runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None,
     ) -> dict[str, Any]:
         """Build only the fresh turn message without merging it into history."""
+        current, _ = self._current_message_parts(
+            current_message, media=media, current_role=current_role,
+            runtime_context_blocks=runtime_context_blocks)
+        return current
+
+    def _current_message_parts(
+        self, current_message: str, *, media: list[str] | None = None,
+        current_role: str = "user",
+        runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None,
+    ) -> tuple[dict[str, Any], list[RuntimeContextBlock]]:
         content = self.build_user_content(current_message, image_paths=media)
         blocks: list[RuntimeContextBlock] = []
         if current_role == "user":
@@ -333,7 +427,7 @@ class ContextBuilder:
             current["_meta"] = {
                 RUNTIME_CONTEXT_MESSAGE_META: runtime_context_meta,
             }
-        return current
+        return current, blocks
 
     def build_user_content(
         self,

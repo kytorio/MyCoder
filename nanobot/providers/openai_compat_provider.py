@@ -1531,6 +1531,9 @@ class OpenAICompatProvider(LLMProvider):
                         content=content,
                         reasoning_content=reasoning_content,
                         finish_reason=str(response_map.get("finish_reason") or "stop"),
+                        context_acceptance="accepted" if response_map.get("finish_reason") in {
+                            "stop", "length", "tool_calls", "function_call"
+                        } else "unknown",
                         usage=self._extract_usage(response_map),
                     )
                 return LLMResponse(
@@ -1601,6 +1604,11 @@ class OpenAICompatProvider(LLMProvider):
                 tool_calls=parsed_tool_calls,
                 finish_reason=finish_reason,
                 usage=self._extract_usage(response_map),
+                context_acceptance="accepted" if any(
+                    (self._maybe_mapping(ch) or {}).get("finish_reason") in {
+                        "stop", "length", "tool_calls", "function_call"
+                    } for ch in choices
+                ) else "unknown",
                 reasoning_content=reasoning_content if isinstance(reasoning_content, str) else None,
             )
 
@@ -1652,6 +1660,11 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
+            context_acceptance="accepted" if any(
+                getattr(ch, "finish_reason", None) in {
+                    "stop", "length", "tool_calls", "function_call"
+                } for ch in response.choices
+            ) else "unknown",
             reasoning_content=reasoning_content,
         )
 
@@ -1661,6 +1674,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
+        terminal_seen = False
         usage: LLMUsage | None = None
 
         def _accum_tc(tc: Any, idx_hint: int) -> None:
@@ -1726,6 +1740,7 @@ class OpenAICompatProvider(LLMProvider):
                 choice = cls._maybe_mapping(choices[0]) or {}
                 if choice.get("finish_reason"):
                     finish_reason = str(choice["finish_reason"])
+                    terminal_seen = True
                 delta = cls._maybe_mapping(choice.get("delta")) or {}
                 raw_delta_content = delta.get("content")
                 text = cls._extract_text_content(raw_delta_content)
@@ -1757,6 +1772,7 @@ class OpenAICompatProvider(LLMProvider):
             choice = chunk.choices[0]
             if choice.finish_reason:
                 finish_reason = choice.finish_reason
+                terminal_seen = True
             delta = choice.delta
             if delta and delta.content:
                 text = cls._extract_text_content(delta.content)
@@ -1813,6 +1829,8 @@ class OpenAICompatProvider(LLMProvider):
             finish_reason=finish_reason,
             usage=usage,
             reasoning_content="".join(reasoning_parts) or None,
+            context_acceptance="accepted" if terminal_seen and finish_reason in {
+                "stop", "length", "tool_calls", "function_call"} else "unknown",
         )
 
     @classmethod
@@ -1901,6 +1919,12 @@ class OpenAICompatProvider(LLMProvider):
     # Public API
     # ------------------------------------------------------------------
 
+    def _guard_context_receipt(self, response: LLMResponse) -> LLMResponse:
+        # Explicit wire overrides can replace the logical input hashed by the base.
+        if {"messages", "input", "instructions", "system", "prompt"}.intersection(self._extra_body):
+            response.context_acceptance = "unknown"
+        return response
+
     async def chat_with_context(
         self,
         *,
@@ -1954,7 +1978,7 @@ class OpenAICompatProvider(LLMProvider):
                         state_input_items=cast(list[dict[str, Any]], body["input"]),
                     )
                     self._record_responses_success(model, reasoning_effort)
-                    return result
+                    return self._guard_context_receipt(result)
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":
                         # Copilot gateway exposes GPT-5/o-series only via /responses;
@@ -1975,7 +1999,7 @@ class OpenAICompatProvider(LLMProvider):
                 Any,
                 await client.chat.completions.create(**kwargs),
             )
-            return self._parse(chat_raw)
+            return self._guard_context_receipt(self._parse(chat_raw))
         except Exception as e:
             return self._handle_error(e, spec=self._spec, api_base=self.api_base)
 
@@ -2042,6 +2066,8 @@ class OpenAICompatProvider(LLMProvider):
                         usage=usage,
                         reasoning_content=reasoning_content,
                     )
+                    if capture.completed and finish_reason in {"stop", "length", "tool_calls"}:
+                        result.context_acceptance = "accepted"
                     if capture.completed and is_replayable_finish_reason(finish_reason):
                         result.provider_state = build_responses_state(
                             provider=self._responses_state_provider(),
@@ -2062,7 +2088,7 @@ class OpenAICompatProvider(LLMProvider):
                         )
                         if result.provider_compaction_applied:
                             result.provider_compaction_scope = "current_request"
-                    return result
+                    return self._guard_context_receipt(result)
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":
                         # Copilot gateway exposes GPT-5/o-series only via /responses;
@@ -2146,7 +2172,7 @@ class OpenAICompatProvider(LLMProvider):
                                 "name": str(_get(function_call, "name") or ""),
                                 "arguments_delta": str(_get(function_call, "arguments") or ""),
                             })
-            return self._parse_chunks(chunks)
+            return self._guard_context_receipt(self._parse_chunks(chunks))
         except asyncio.TimeoutError:
             return LLMResponse(
                 content=(

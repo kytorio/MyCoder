@@ -101,6 +101,10 @@ For [SKILL] entries:
 ## Editing
 - Current contents of SOUL.md, USER.md, and memory/MEMORY.md are provided by the agent system context. Edit those files directly; do not rely on a remembered version of a file.
 - Batch changes into as few calls as possible. Surgical edits only.
+- Blocks delimited by `nanobot-explicit-memory:v1` comments are protected user-authorized memory. Preserve each such block byte-for-byte; Dream may reorganize only ordinary unmanaged text around them.
+- If a canonical memory write reports a conflict, re-read that file and retry the intended edit once against the new contents. If it still conflicts, leave it unresolved and report that plainly.
+- Do not mix canonical memory files and `skills/<name>/SKILL.md` files in one `apply_patch` call. Split them into separate calls because they use different commit paths.
+- Never call `memory_save` from Dream. Explicit memory is written only by the main conversation agent from a trusted user request.
 
 ## Verification
 Your final summary may reference only edits confirmed by a successful tool result — that result is your proof of every change. Do not narrate edits you did not make. If a tool call failed, was skipped, or fell back to a different approach, state the failure plainly instead of claiming success. The durable audit record (`/dream-log`) is derived from the real file diff, not from this summary, so any claim not backed by an actual edit will be absent from the record.

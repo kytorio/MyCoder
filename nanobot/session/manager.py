@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Collection, Generator, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Callable, Collection, Generator, Protocol, TypedDict, cast
 from weakref import WeakValueDictionary
 
 from filelock import FileLock
@@ -40,6 +40,9 @@ from nanobot.utils.helpers import (
     strip_think,
 )
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
+
+if TYPE_CHECKING:
+    from nanobot.agent.context_plan import ContextConsumption
 
 SESSION_CACHE_MAX_SIZE = 128
 MIN_COMPACTED_REPLAY_MESSAGES = 8
@@ -285,6 +288,7 @@ class Session:
     # Keep the legacy storage name while persisted sessions and SDK callers migrate.
     last_consolidated: int = 0
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
+    context_consumption: "ContextConsumption | None" = field(default=None, repr=False, compare=False)
     policy: SessionPolicy = field(default_factory=SessionPolicy, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -439,6 +443,11 @@ class Session:
             for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
                 if key in message:
                     entry[key] = message[key]
+            tool_meta = message.get("_meta")
+            if role == "tool" and isinstance(tool_meta, dict):
+                tool_result_error = cast(dict[str, Any], tool_meta).get("tool_result_error")
+                if isinstance(tool_result_error, bool):
+                    entry["_meta"] = {"tool_result_error": tool_result_error}
             out.append(entry)
 
         if max_tokens > 0 and out:
@@ -479,6 +488,7 @@ class Session:
         self.messages = []
         self.last_archived = 0
         self.provider_state = None
+        self.context_consumption = None
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
 
@@ -1802,6 +1812,14 @@ class SessionManager:
         # Third-party stores keep their existing all-or-nothing semantics until
         # they opt into a dedicated checkpoint primitive.
         self.save(session)
+
+    def has_runtime_checkpoint(self, key: str) -> bool:
+        """Return whether a regular volatile checkpoint sidecar exists."""
+        try:
+            checkpoint_stat = self._get_runtime_checkpoint_path(key).lstat()
+        except OSError:
+            return False
+        return stat.S_ISREG(checkpoint_stat.st_mode)
 
     def rename_model_preset(self, old_name: str, new_name: str) -> int:
         """Rename a session-scoped model preset across durable and live sessions."""
