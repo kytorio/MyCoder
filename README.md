@@ -32,9 +32,30 @@
   </p>
 </div>
 
-# nanobot
+# MyCoder
+
+**MyCoder** 是基于开源项目 [nanobot](https://github.com/HKUDS/nanobot)（HKUDS/nanobot）的二次开发版本（fork）。上游 nanobot 保留不动，MyCoder 沿用其运行时、包名和 CLI，在此之上追加了上下文压缩治理、显式记忆保存与 Dream 协作、在线/离线双通道评测体系等能力；具体改动见下方[「MyCoder 相对 nanobot 的改动」](#-mycoder-相对-nanobot-的改动)。
 
 🐈 **nanobot** is an ultra-lightweight, open-source, self-hosted personal AI agent framework written in Python. It runs in a WebUI, terminal, or chat apps and combines tools, long-term memory, MCP integrations, model routing, multi-agent delegation, scheduled automation, and an OpenAI-compatible API in a small, readable core.
+
+## 🧬 MyCoder 相对 nanobot 的改动
+
+MyCoder 的 Git 历史与上游 `nanobot`（`upstream` remote：`https://github.com/HKUDS/nanobot.git`）共享至提交 `45553316`（`fix(tui): distinguish fenced code blocks`）。在此基线之上，本仓库目前只追加了一个本地提交：
+
+- `09655239` — `feat: 修改上下文压缩机制，增加事件驱动更新记忆模块，建设在线/离线评测体系双通道`（121 个文件，+19209 / −289 行）
+
+根据该提交的改动文件（`git show --stat`）以及 [spec/README.md](spec/README.md)、[spec/IMPLEMENTATION.md](spec/IMPLEMENTATION.md) 中的实施记录，这次改动在 nanobot 原有 Agent Loop 之上新增/修改了三部分能力：
+
+1. **上下文压缩治理**（`nanobot/agent/context.py`、`context_governance.py`、`context_plan.py`、`context_sources.py`、`context_artifacts.py`，并改动了 `agent/runner.py`、`agent/loop.py`）
+   在原有会话历史 + Dream 摘要之外，引入四层上下文压缩规划（历史分层 / artifact 预算 / 来源策略 / 摘要与恢复），对每次请求前的上下文做预算和来源账本管理；被回收的历史内容会落盘为可分页读取的 artifact，而不是直接丢弃。
+2. **显式记忆与 Dream 协作**（新增 `agent/memory_writes.py`、`agent/tools/memory_save.py`，改动 `agent/memory.py`、`templates/agent/dream.md`）
+   新增由主模型主动调用的 `memory_save` 工具（默认关闭，不采用单独的输入意图识别或记忆分类模型），通过 `MemoryWriteCoordinator` 做受控的原子提交（预检→journal→写入→校验→receipt），并让原有 Dream 周期整理与显式记忆条目合并、避免互相覆盖冲突。
+3. **在线/离线双通道评测体系**（新增 `nanobot/evaluation/` 整包：`runner.py`、`providers.py`、`metrics.py`、`scenarios.py`、`verifiers.py`、`models.py`、`__main__.py`）
+   离线通道用脚本化 provider 和真实 `AgentLoop`/隔离 workspace 跑机制性回归（不联网、不计费）；在线通道（`LiveEvaluationProvider`）可选接入真实模型 API，在预算上限内统计真实 usage/时延；两者共享同一套 fixture 与结果比较（compare）逻辑。
+
+配套新增的规格与文档：`spec/S00`–`S03`、`spec/TASKS.md`、`spec/tasks/N00`–`N12` 逐任务记录，以及 `docs/engineering/context-memory-*.md` 系列指南。
+
+**现状**：以上功能默认保持关闭 / observe-only（上下文治理只观测不生效，`memory_save` 工具默认不注册），生产启用需要单独的人工授权，详见 [spec/README.md](spec/README.md) 与 [spec/IMPLEMENTATION.md](spec/IMPLEMENTATION.md) 的门禁说明。
 
 ## Start Here
 
